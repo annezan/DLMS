@@ -1,0 +1,6 @@
+*Mettre à jour la collection postman de mon API "DLMS.API" et enregistre dans un fichier "DLMS_API.postman_collection.json" en utilisant les élements des sous dossiers:
+-CommandeCompteurDomain
+
+
+*Je veux inclure des exemples de payloads (body)
+*Tiens compte des élements qui sont dans les dossiers "Commamds", "Entities" et "Queries" au niveau de "DLMS_MODELS" 

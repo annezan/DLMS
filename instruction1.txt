@@ -1,0 +1,2 @@
+-Ajout de la gestion des cellules, avec PostId comme clé étrangère.
+-Les propriétés sont Id,Numero,Libelle,Adresse

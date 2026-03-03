@@ -1,0 +1,74 @@
+﻿# Résumé des modifications effectuées
+
+## MODIFICATIONS TERMINÉES :
+
+### 1. ENTITÉS
+✓ Compteur.cs - PosteId supprimé
+✓ Equipement.cs - PosteId ajouté avec navigation property Poste
+✓ Poste.cs - Collection Equipements ajoutée
+
+### 2. COMMANDS
+✓ CompteurAddCommand.cs - PosteId supprimé
+✓ EquipementAddCommand.cs - PosteId ajouté
+✓ EquipementEditCommand.cs - PosteId ajouté
+
+### 3. RESPONSES
+✓ EquipementResponse.cs - PosteId ajouté
+
+### 4. REPOSITORIES
+✓ CompteurCommandRepository.cs - Gestion PosteId supprimée
+✓ EquipementCommandRepository.cs - Gestion PosteId ajoutée
+
+### 5. SCRIPTS SQL
+✓ migration_poste.sql - Script de migration créé
+
+## MODIFICATIONS À FAIRE MANUELLEMENT :
+
+### 1. MAPPERS (DLMS_BUSINESS)
+Vous devez mettre à jour les mappers AutoMapper :
+
+#### CompteurMappingProfile.cs
+Supprimer le mapping de PosteId si présent
+
+#### EquipementMappingProfile.cs  
+Ajouter le mapping de PosteId :
+`csharp
+CreateMap<EquipementAddCommand, Equipement>()
+    .ForMember(dest => dest.PosteId, opt => opt.MapFrom(src => src.PosteId));
+
+CreateMap<EquipementEditCommand, Equipement>()
+    .ForMember(dest => dest.PosteId, opt => opt.MapFrom(src => src.PosteId));
+
+CreateMap<Equipement, EquipementResponse>()
+    .ForMember(dest => dest.PosteId, opt => opt.MapFrom(src => src.PosteId));
+`
+
+### 2. CONFIGURATION BASE DE DONNÉES (DLMSDBContext.cs)
+Ajouter la configuration de la relation Equipement-Poste dans OnModelCreating :
+
+`csharp
+modelBuilder.Entity<Equipement>(entity =>
+{
+    // ... configuration existante ...
+    
+    entity.Property(e => e.PosteId).HasColumnName("poste_id");
+    
+    entity.HasOne(d => d.Poste)
+        .WithMany(p => p.Equipements)
+        .HasForeignKey(d => d.PosteId)
+        .OnDelete(DeleteBehavior.SetNull)
+        .HasConstraintName("FK_Equipement_Poste");
+});
+`
+
+### 3. MIGRATION BASE DE DONNÉES
+Exécutez le script migration_poste.sql sur votre base de données.
+
+ATTENTION : Faites une sauvegarde avant d'exécuter la migration !
+
+### 4. CONTROLLERS
+Vérifiez si des controllers utilisent PosteId de Compteur et mettez-les à jour pour utiliser PosteId d'Equipement.
+
+### 5. TESTS
+Testez toutes les fonctionnalités après migration pour s'assurer que tout fonctionne correctement.
+

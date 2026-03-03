@@ -1,0 +1,6 @@
+@API_DLMS_HostAddress = http://localhost:5012
+
+GET {{API_DLMS_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

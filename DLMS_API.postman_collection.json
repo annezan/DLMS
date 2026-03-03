@@ -1,0 +1,121 @@
+{
+  "info": {
+    "_postman_id": "DLMS-API-Collection",
+    "name": "DLMS.API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Compteur",
+      "item": [
+        {
+          "name": "Ajouter un compteur",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"IdCompteur\": \"CMP123\",\n  \"NumeroCompteur\": \"00012345\",\n  \"MarqueCompteur\": \"Schneider\",\n  \"DatePremierePose\": \"2023-01-01T00:00:00\",\n  \"DatePoseActuelle\": \"2023-06-01T00:00:00\",\n  \"Typecompteur\": \"Monophasé\",\n  \"FabriquantId\": 1,\n  \"PosteId\": 2,\n  \"Etatcontacteur\": \"Ouvert\",\n  \"CreatedBy\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/Compteur/add",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "Compteur", "add"]
+            }
+          }
+        },
+        {
+          "name": "Editer un compteur",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"Id\": 1,\n  \"IdCompteur\": \"CMP123\",\n  \"NumeroCompteur\": \"00012345\",\n  \"MarqueCompteur\": \"Schneider\",\n  \"DatePremierePose\": \"2023-01-01T00:00:00\",\n  \"DatePoseActuelle\": \"2023-06-01T00:00:00\",\n  \"Typecompteur\": \"Monophasé\",\n  \"FabriquantId\": 1,\n  \"Idposte\": 2,\n  \"Etatcontacteur\": \"Ouvert\",\n  \"UpdatedBy\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/Compteur/edit",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "Compteur", "edit"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Users",
+      "item": [
+        {
+          "name": "Ajouter un utilisateur",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"Nom\": \"Dupont\",\n  \"Prenoms\": \"Jean\",\n  \"DateNaissance\": \"1990-01-01\",\n  \"Email\": \"jean.dupont@example.com\",\n  \"Mobile\": \"0600000000\",\n  \"RoleId\": \"00000000-0000-0000-0000-000000000001\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/Users/add",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "Users", "add"]
+            }
+          }
+        },
+        {
+          "name": "Editer un utilisateur",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"Id\": \"00000000-0000-0000-0000-000000000001\",\n  \"Nom\": \"Dupont\",\n  \"Prenoms\": \"Jean\",\n  \"DateNaissance\": \"1990-01-01\",\n  \"Email\": \"jean.dupont@example.com\",\n  \"Mobile\": \"0600000000\",\n  \"RoleId\": \"00000000-0000-0000-0000-000000000001\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/Users/edit",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "Users", "edit"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Commande",
+      "item": [
+        {
+          "name": "Ajouter une commande",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"Libellecommande\": \"Lecture Index\",\n  \"Dateexec\": \"2023-07-01T10:00:00\",\n  \"Datefin\": \"2023-07-01T12:00:00\",\n  \"Numeroprofile\": 1,\n  \"Nombreentree\": 2,\n  \"Datedebut\": \"2023-07-01T10:00:00\",\n  \"Dateexp\": \"2023-07-01T12:00:00\",\n  \"TypecommandeId\": 1,\n  \"CompteurId\": [1,2],\n  \"CreatedBy\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/Commande/add",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "Commande", "add"]
+            }
+          }
+        },
+        {
+          "name": "Editer une commande",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"Id\": 1,\n  \"Libellecommande\": \"Lecture Index\",\n  \"Dateexec\": \"2023-07-01T10:00:00\",\n  \"Datefin\": \"2023-07-01T12:00:00\",\n  \"Numeroprofile\": 1,\n  \"Nombreentree\": 2,\n  \"Datedebut\": \"2023-07-01T10:00:00\",\n  \"Dateexp\": \"2023-07-01T12:00:00\",\n  \"TypecommandeId\": 1,\n  \"CompteurId\": [1,2],\n  \"UpdatedBy\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/Commande/edit",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "Commande", "edit"]
+            }
+          }
+        }
+      ]
+    }
+    
+  ]
+}

@@ -13,7 +13,7 @@ namespace DLMS_SERVICE.Services
 {
     public interface IDLMSGuruxSessionFactory : IDisposable
     {
-        DLMSGuruxSession CreateSession(DLMSConnectionParameters parameters);
+        IDLMSCommunicationSession CreateSession(DLMSConnectionParameters parameters);
     }
 
     public class DLMSGuruxSession : IDLMSCommunicationSession, IDisposable
@@ -89,9 +89,13 @@ namespace DLMS_SERVICE.Services
                 ParameterCommunication.ConfigureMedia(Media, Parameters);
 
                 // 🔴 GESTION DES ERREURS DE CONNEXION SANS BLOCAGE
+                // Timeout de connexion transport: 10s pour détecter rapidement les SIM down
                 var connectionSuccess = false;
                 try
                 {
+                    using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    connectCts.CancelAfter(TimeSpan.FromSeconds(10));
+
                     await Task.Run(() =>
                     {
                         try
@@ -102,19 +106,17 @@ namespace DLMS_SERVICE.Services
                         }
                         catch (System.Net.Sockets.SocketException ex)
                         {
-                            _logger.LogError(ex, "❌ Erreur de connexion réseau à {Ip}:{Port} - Équipement inaccessible ou timeout", 
+                            _logger.LogError(ex, "❌ Erreur de connexion réseau à {Ip}:{Port} - Équipement inaccessible ou timeout",
                                 Parameters.AddressIp, Parameters.Port);
-                            // Ne pas bloquer - retourner directement
                             return;
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex, "❌ Erreur inattendue lors de l'ouverture du transport vers {Ip}:{Port}", 
+                            _logger.LogError(ex, "❌ Erreur inattendue lors de l'ouverture du transport vers {Ip}:{Port}",
                                 Parameters.AddressIp, Parameters.Port);
-                            // Ne pas bloquer - retourner directement
                             return;
                         }
-                    }, ct);
+                    }, connectCts.Token);
 
                     if (connectionSuccess)
                     {
@@ -161,7 +163,7 @@ namespace DLMS_SERVICE.Services
         }
 
         // 🔥 Association DLMS PAR COMPTEUR (HDLC)
-        public void InitializeMeterClient(DLMSConnectionParameters meterParams)
+        public void InitializeMeterClient(DLMSConnectionParameters meterParams, int? waitTime = null, int? retryCount = null)
         {
             try
             {
@@ -173,14 +175,19 @@ namespace DLMS_SERVICE.Services
 
                 // Créer le reader pour ce compteur
                 Reader = new Gurux.DLMS.Reader.GXDLMSReader(
-                    Client, 
-                    Media, 
-                    Trace, 
+                    Client,
+                    Media,
+                    Trace,
                     InvocationCounter);
+
+                // Configuration dynamique basée sur la santé du compteur
+                Reader.RetryCount = retryCount ?? 2;
+                Reader.WaitTime = waitTime ?? 3000;
 
                 AssociationLoaded = false;
 
-                _logger.LogDebug("✅ Client DLMS initialisé pour {Serial}", meterParams.SerialNumber);
+                _logger.LogDebug("✅ Client DLMS initialisé pour {Serial} (WaitTime={WaitTime}ms, RetryCount={RetryCount})",
+                    meterParams.SerialNumber, Reader.WaitTime, Reader.RetryCount);
             }
             catch (Exception ex)
             {
@@ -236,7 +243,7 @@ namespace DLMS_SERVICE.Services
             _sessionLogger = sessionLogger ?? throw new ArgumentNullException(nameof(sessionLogger));
         }
 
-        public DLMSGuruxSession CreateSession(DLMSConnectionParameters parameters)
+        public IDLMSCommunicationSession CreateSession(DLMSConnectionParameters parameters)
         {
             try
             {

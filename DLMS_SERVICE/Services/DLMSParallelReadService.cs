@@ -16,7 +16,7 @@ namespace DLMS_SERVICE.Services
 {
     public interface IDLMSParallelReadService
     {
-        Task ProcessUmadGroupAsync(string ip, int port, List<CompteurEquipement> meters, CancellationToken ct);
+        Task ProcessUmadGroupAsync(string ip, int port, List<CompteurEquipement> meters, CancellationToken ct, DateTime? cycleStartTime = null);
         Task ProcessUmadMissingReadsGroupAsync(string ip, int port, List<MissingReadInfo> missingReads, CancellationToken ct);
         Task ProcessUmadCommandGroupAsync(string ip, int port, List<ActiveCommandInfo> commands, CancellationToken ct);
     }
@@ -30,6 +30,7 @@ namespace DLMS_SERVICE.Services
         private readonly ILogger<DLMSParallelReadService> _logger;
         private readonly IServiceProvider _serviceProvider;
         private readonly IDLMSMetricsService _metricsService;
+        private readonly IMeterHealthTracker _healthTracker;
         private readonly TimeSpan _readTimeout = TimeSpan.FromMinutes(3);
 
         public DLMSParallelReadService(
@@ -39,7 +40,8 @@ namespace DLMS_SERVICE.Services
             IDLMSHardwareService hardwareService,
             ILogger<DLMSParallelReadService> logger,
             IServiceProvider serviceProvider,
-            IDLMSMetricsService metricsService)
+            IDLMSMetricsService metricsService,
+            IMeterHealthTracker healthTracker)
         {
             _sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
             _keyService = keyService ?? throw new ArgumentNullException(nameof(keyService));
@@ -48,18 +50,20 @@ namespace DLMS_SERVICE.Services
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
             _metricsService = metricsService ?? throw new ArgumentNullException(nameof(metricsService));
+            _healthTracker = healthTracker ?? throw new ArgumentNullException(nameof(healthTracker));
         }
 
         public async Task ProcessUmadGroupAsync(
             string ip,
             int port,
             List<CompteurEquipement> meters,
-            CancellationToken ct)
+            CancellationToken ct,
+            DateTime? cycleStartTime = null)
         {
-            _logger.LogInformation("🚀 UMAD {Ip}:{Port} — {Count} compteurs", 
+            _logger.LogInformation("🚀 UMAD {Ip}:{Port} — {Count} compteurs",
                 ip, port, meters.Count);
 
-            DLMSGuruxSession session = null;
+            IDLMSCommunicationSession session = null;
             try
             {
                 // ===============================
@@ -83,28 +87,132 @@ namespace DLMS_SERVICE.Services
                 _logger.LogInformation("✅ Transport UMAD ouvert {Ip}:{Port}", ip, port);
 
                 // ===============================
-                // 2️⃣ Boucle compteurs avec association DLMS individuelle
+                // 2️⃣ Tri intelligent des compteurs par score de priorité
                 // ===============================
-                foreach (var meter in meters)
+                var orderedMeters = meters
+                    .OrderBy(m => _healthTracker.GetPriorityScore(m.Compteur?.NumeroCompteur))
+                    .ToList();
+
+                _logger.LogInformation("📊 Ordre de lecture pour {Ip}: {Order}",
+                    ip, string.Join(", ", orderedMeters.Take(5).Select(m =>
+                    {
+                        var serial = m.Compteur?.NumeroCompteur ?? "?";
+                        var cat = _healthTracker.GetCategory(serial);
+                        return $"{serial}({cat})";
+                    })));
+
+                // ===============================
+                // 3️⃣ Budget temps par concentrateur
+                // ===============================
+                var cycleDeadline = (cycleStartTime ?? DateTime.Now).AddMinutes(55); // 5 min de marge
+                var concentratorDegraded = false;
+
+                // ===============================
+                // 4️⃣ Test canari : tester le premier compteur avec timeout serré
+                // ===============================
+                if (orderedMeters.Count > 1)
                 {
-                    ct.ThrowIfCancellationRequested();
-                    
+                    var canaryMeter = orderedMeters.First();
+                    var canarySerial = canaryMeter.Compteur?.NumeroCompteur;
+                    var canaryHealth = _healthTracker.GetHealthInfo(canarySerial);
+
+                    // Canary avec timeout de 30s
+                    using var canaryCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                    using var canaryLinkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, canaryCts.Token);
+
                     try
                     {
-                        await ReadMeterWithExistingSessionAsync(
-                            session,
-                            meter,
-                            ct,
-                            ip);
+                        var canaryStopwatch = System.Diagnostics.Stopwatch.StartNew();
+                        await ReadMeterWithExistingSessionAsync(session, canaryMeter, canaryLinkedCts.Token, ip, canaryHealth);
+                        canaryStopwatch.Stop();
 
-                        // 🔥 pacing UMAD entre compteurs
-                        await Task.Delay(200, ct);
+                        _logger.LogInformation("🐤 Canari {Serial} OK en {ElapsedMs}ms", canarySerial, canaryStopwatch.ElapsedMilliseconds);
+                        orderedMeters.RemoveAt(0); // Already processed
+                    }
+                    catch (OperationCanceledException) when (canaryCts.Token.IsCancellationRequested)
+                    {
+                        _logger.LogWarning("🐤 Canari {Serial} timeout 30s - concentrateur dégradé {Ip}", canarySerial, ip);
+                        concentratorDegraded = true;
+                        orderedMeters.RemoveAt(0); // Already attempted
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "❌ Erreur compteur {Serial}", meter.Compteur?.NumeroCompteur);
+                        _logger.LogWarning(ex, "🐤 Canari {Serial} échec - concentrateur dégradé {Ip}", canarySerial, ip);
+                        concentratorDegraded = true;
+                        orderedMeters.RemoveAt(0);
+                    }
+
+                    // 🔥 pacing UMAD entre compteurs
+                    await Task.Delay(100, ct);
+                }
+
+                // ===============================
+                // 5️⃣ Boucle compteurs avec timeout adaptatif et budget temps
+                // ===============================
+                var processedCount = 0;
+                var skippedCount = 0;
+
+                for (var i = 0; i < orderedMeters.Count; i++)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    var meter = orderedMeters[i];
+                    var serial = meter.Compteur?.NumeroCompteur;
+                    var remainingCount = orderedMeters.Count - i;
+
+                    // Vérification du budget temps
+                    var timeLeft = cycleDeadline - DateTime.Now;
+                    if (timeLeft <= TimeSpan.FromSeconds(30))
+                    {
+                        skippedCount = remainingCount;
+                        _logger.LogWarning("⏰ Budget épuisé pour {Ip}, {Count} compteurs non traités", ip, remainingCount);
+                        break;
+                    }
+
+                    try
+                    {
+                        // Obtenir les paramètres adaptatifs
+                        var healthInfo = _healthTracker.GetHealthInfo(serial);
+
+                        // Si concentrateur dégradé, utiliser des timeouts ultra-courts
+                        if (concentratorDegraded)
+                        {
+                            healthInfo = new MeterHealthInfo
+                            {
+                                AdaptiveTimeout = TimeSpan.FromSeconds(15),
+                                WaitTime = 2000,
+                                RetryCount = 1,
+                                PriorityScore = healthInfo.PriorityScore,
+                                Category = healthInfo.Category
+                            };
+                        }
+
+                        // Timeout = min(timeout adaptatif, temps restant / compteurs restants)
+                        var maxTimePerMeter = timeLeft.TotalSeconds / remainingCount;
+                        var effectiveTimeout = TimeSpan.FromSeconds(
+                            Math.Min(healthInfo.AdaptiveTimeout.TotalSeconds, maxTimePerMeter));
+
+                        // Minimum 15s pour avoir une chance
+                        if (effectiveTimeout < TimeSpan.FromSeconds(15))
+                            effectiveTimeout = TimeSpan.FromSeconds(15);
+
+                        _logger.LogDebug("⏱️ {Serial}: timeout={Timeout}s, catégorie={Category}, dégradé={Degraded}",
+                            serial, effectiveTimeout.TotalSeconds, healthInfo.Category, concentratorDegraded);
+
+                        await ReadMeterWithExistingSessionAsync(session, meter, ct, ip, healthInfo, effectiveTimeout);
+                        processedCount++;
+
+                        // 🔥 pacing UMAD entre compteurs
+                        await Task.Delay(100, ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "❌ Erreur compteur {Serial}", serial);
                     }
                 }
+
+                _logger.LogInformation("🏁 UMAD {Ip}:{Port} terminé: {Processed} traités, {Skipped} ignorés (budget)",
+                    ip, port, processedCount + 1, skippedCount); // +1 for canary
             }
             finally
             {
@@ -122,7 +230,7 @@ namespace DLMS_SERVICE.Services
                 "🚀 UMAD Missing Reads {Ip}:{Port} — {Count} lectures",
                 ip, port, missingReads.Count);
 
-            DLMSGuruxSession session = null;
+            IDLMSCommunicationSession session = null;
             try
             {
                 // ===============================
@@ -170,7 +278,7 @@ namespace DLMS_SERVICE.Services
                             ct);
                         
                         // 🔥 pacing UMAD entre compteurs
-                        await Task.Delay(200, ct);
+                        await Task.Delay(100, ct);
                     }
                     catch (Exception ex)
                     {
@@ -185,7 +293,7 @@ namespace DLMS_SERVICE.Services
         }
 
         private async Task ReadMissingReadsWithExistingSessionAsync(
-            DLMSGuruxSession session,
+            IDLMSCommunicationSession session,
             string numeroCompteur,
             List<MissingReadInfo> missingReads,
             CancellationToken ct)
@@ -318,7 +426,7 @@ namespace DLMS_SERVICE.Services
                 "🚀 UMAD Commands {Ip}:{Port} — {Count} commandes",
                 ip, port, commands.Count);
 
-            DLMSGuruxSession session = null;
+            IDLMSCommunicationSession session = null;
             try
             {
                 // ===============================
@@ -366,7 +474,7 @@ namespace DLMS_SERVICE.Services
                             ct);
                         
                         // 🔥 pacing UMAD entre compteurs
-                        await Task.Delay(200, ct);
+                        await Task.Delay(100, ct);
                     }
                     catch (Exception ex)
                     {
@@ -383,7 +491,7 @@ namespace DLMS_SERVICE.Services
         }
 
         private async Task ReadCommandsWithExistingSessionAsync(
-            DLMSGuruxSession session,
+            IDLMSCommunicationSession session,
             List<ActiveCommandInfo> commands,
             CancellationToken ct)
         {
@@ -466,7 +574,7 @@ namespace DLMS_SERVICE.Services
         }
 
         private async Task ReadCommandWithExistingSessionAsync(
-            DLMSGuruxSession session,
+            IDLMSCommunicationSession session,
             ActiveCommandInfo command,
             CancellationToken ct)
         {
@@ -544,15 +652,22 @@ namespace DLMS_SERVICE.Services
         }
 
         private async Task ReadMeterWithExistingSessionAsync(
-            DLMSGuruxSession session,
+            IDLMSCommunicationSession session,
             CompteurEquipement meter,
             CancellationToken ct,
-            string ip = null)
+            string ip = null,
+            MeterHealthInfo healthInfo = null,
+            TimeSpan? effectiveTimeout = null)
         {
             var serial = meter.Compteur?.NumeroCompteur;
             var clientAddress = "read";
-            
-            _logger.LogDebug("🔎 Lecture compteur {Serial}", serial);
+
+            // Utiliser le health info fourni ou obtenir un nouveau
+            healthInfo ??= _healthTracker.GetHealthInfo(serial);
+            var timeout = effectiveTimeout ?? healthInfo.AdaptiveTimeout;
+
+            _logger.LogDebug("🔎 Lecture compteur {Serial} (timeout={Timeout}s, cat={Category})",
+                serial, timeout.TotalSeconds, healthInfo.Category);
 
             // ===============================
             // 1️⃣ Récupérer clés DLMS
@@ -578,13 +693,12 @@ namespace DLMS_SERVICE.Services
             };
 
             // ===============================
-            // 🔥 3️⃣ ASSOCIATION DLMS PAR COMPTEUR
+            // 🔥 3️⃣ ASSOCIATION DLMS PAR COMPTEUR (config dynamique via health tracker)
             // ===============================
-            // 🔴 GESTION DES ERREURS D'ASSOCIATION DLMS SANS BLOCAGE
             var connectionSuccess = false;
             try
             {
-                session.InitializeMeterClient(meterParams);
+                session.InitializeMeterClient(meterParams, healthInfo.WaitTime, healthInfo.RetryCount);
 
                 await Task.Run(() =>
                 {
@@ -596,7 +710,6 @@ namespace DLMS_SERVICE.Services
                     catch (Exception ex)
                     {
                         _logger.LogError(ex, "❌ Erreur lors de l'initialisation de la connexion DLMS pour le compteur {Serial}", serial);
-                        // Ne pas bloquer - retourner directement
                         return;
                     }
                 }, ct);
@@ -608,24 +721,25 @@ namespace DLMS_SERVICE.Services
                 else
                 {
                     _logger.LogWarning("⚠️ Connexion DLMS échouée pour le compteur {Serial} - passage au compteur suivant", serial);
-                    return; // Sort de la méthode si connexion échouée
+                    _healthTracker.RecordResult(serial, TimeSpan.Zero, false);
+                    return;
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "❌ Erreur lors de l'association DLMS pour le compteur {Serial}", serial);
-                // Ne pas bloquer - retourner pour continuer avec les autres compteurs
+                _healthTracker.RecordResult(serial, TimeSpan.Zero, false);
                 return;
             }
 
             // ===============================
-            // 4️⃣ Lecture principale avec timeout global de 3 minutes
+            // 4️⃣ Lecture principale avec timeout adaptatif
             // ===============================
             session.ReadObjects.Clear();
             session.ReadObjects.AddRange(ParseObjects("0.0.42.0.0.255:2;0.0.96.2.128.255:2;1.0.99.1.0.255:4;1.0.99.2.0.255:4;0.0.0.2.8.255:2;0.0.0.2.0.255:2;1.0.0.2.2.255:2"));
 
-            // ⏱️ Timeout global pour tout le traitement du compteur (3 minutes)
-            using var globalTimeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
+            // ⏱️ Timeout adaptatif basé sur la santé du compteur
+            using var globalTimeoutCts = new CancellationTokenSource(timeout);
             using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, globalTimeoutCts.Token);
             
             var globalStopwatch = System.Diagnostics.Stopwatch.StartNew();
@@ -642,17 +756,18 @@ namespace DLMS_SERVICE.Services
                 if (!readResult.Success)
                 {
                     _logger.LogWarning("⚠️ Lecture échouée {Serial}: {Error}", serial, readResult.ErrorMessage);
-                    
+
                     // 📊 Enregistrer les métriques d'échec
                     try
                     {
                         _metricsService?.RecordMeterRead(ip ?? "unknown", serial, readStopwatch.Elapsed, false);
+                        _healthTracker.RecordResult(serial, readStopwatch.Elapsed, false);
                     }
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex, "⚠️ Erreur lors de l'enregistrement des métriques d'échec");
                     }
-                    
+
                     return;
                 }
 
@@ -708,35 +823,38 @@ namespace DLMS_SERVICE.Services
                 try
                 {
                     _metricsService?.RecordMeterRead(ip ?? "unknown", serial, globalStopwatch.Elapsed, true);
+                    _healthTracker.RecordResult(serial, globalStopwatch.Elapsed, true);
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "⚠️ Erreur lors de l'enregistrement des métriques de succès");
                 }
-                
+
                 globalStopwatch.Stop();
                 _logger.LogInformation("🏁 Traitement complet du compteur {Serial} terminé en {ElapsedMs}ms", serial, globalStopwatch.ElapsedMilliseconds);
             }
             catch (OperationCanceledException) when (globalTimeoutCts.Token.IsCancellationRequested)
             {
                 globalStopwatch.Stop();
-                _logger.LogWarning("⏰ Timeout global de 3 minutes atteint pour le compteur {Serial} après {ElapsedMs}ms", serial, globalStopwatch.ElapsedMilliseconds);
-                
+                _logger.LogWarning("⏰ Timeout adaptatif ({Timeout}s) atteint pour le compteur {Serial} après {ElapsedMs}ms",
+                    timeout.TotalSeconds, serial, globalStopwatch.ElapsedMilliseconds);
+
                 // 📊 Enregistrer les métriques d'échec (timeout)
                 try
                 {
                     _metricsService?.RecordMeterRead(ip ?? "unknown", serial, globalStopwatch.Elapsed, false);
+                    _healthTracker.RecordResult(serial, globalStopwatch.Elapsed, false);
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "⚠️ Erreur lors de l'enregistrement des métriques d'échec (timeout)");
                 }
-                
+
                 return;
             }
         }
 
-        private async Task<ReadResult> ReadProfileDataAsync(DLMSGuruxSession session, DateTime dateStart, DateTime dateEnd, CancellationToken ct = default)
+        private async Task<ReadResult> ReadProfileDataAsync(IDLMSCommunicationSession session, DateTime dateStart, DateTime dateEnd, CancellationToken ct = default)
         {
             // 🔴 PAS DE TIMEOUT INDIVIDUEL - utilise le timeout global passé
             try
@@ -781,7 +899,7 @@ namespace DLMS_SERVICE.Services
             }
         }
 
-        private async Task<ReadResult> ReadRowsByEntryAsync(DLMSGuruxSession session, int nombreEntree)
+        private async Task<ReadResult> ReadRowsByEntryAsync(IDLMSCommunicationSession session, int nombreEntree)
         {
             try
             {
@@ -861,7 +979,7 @@ namespace DLMS_SERVICE.Services
             return result;
         }
         private async Task<ReadResult> 
-            ReadCompteurDataAsync(DLMSGuruxSession session, CompteurEquipement compteurEquipement, CancellationToken ct = default)
+            ReadCompteurDataAsync(IDLMSCommunicationSession session, CompteurEquipement compteurEquipement, CancellationToken ct = default)
         {
             // 🔴 PAS DE TIMEOUT INDIVIDUEL - utilise le timeout global passé
             try
@@ -906,7 +1024,7 @@ namespace DLMS_SERVICE.Services
             }
         }
 
-        private async Task<ReadResult> ExecuteSpecificCommandAsync(DLMSGuruxSession session, ActiveCommandInfo command)
+        private async Task<ReadResult> ExecuteSpecificCommandAsync(IDLMSCommunicationSession session, ActiveCommandInfo command)
         {
             // 🔴 AJOUT DU TIMEOUT DLMS MANQUANT pour les commandes
             using var timeoutCts = new CancellationTokenSource(_readTimeout);

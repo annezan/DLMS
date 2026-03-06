@@ -88,9 +88,10 @@ namespace DLMS_SERVICE.Services
                 _logger.LogInformation("📝 Enqueue des lectures horaires pour {Count} groupes IP ({TotalCount} compteurs)", 
                     compteursByIp.Count, compteurs.Count);
 
-                // Envoyer chaque groupe d'IP dans la queue prioritaire
+                // Envoyer chaque groupe d'IP dans la queue prioritaire avec le cycle start time
+                var cycleStartTime = DateTime.Now;
                 var tasks = compteursByIp
-                    .Select(group => _workerService.EnqueueHourlyReadsAsync(group.ToList(), now))
+                    .Select(group => _workerService.EnqueueHourlyReadsAsync(group.ToList(), now, cycleStartTime))
                     .ToList();
 
                 await Task.WhenAll(tasks);

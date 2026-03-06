@@ -34,7 +34,12 @@ namespace DLMS_SERVICE.Services
                     var now = DateTime.Now;
                     _logger.LogDebug("Cycle de détection des lectures manquantes à {Time}", now);
 
-                    await EnqueueMissingReadsAsync(now);
+                    // Fenêtre temporelle: minutes 10-25 uniquement
+                    // Le HourlyReadsWorker démarre à minute 31, donc pas de conflit
+                    if (now.Minute >= 10 && now.Minute <= 25)
+                    {
+                        await EnqueueMissingReadsAsync(now);
+                    }
                 }
                 catch (Exception ex)
                 {

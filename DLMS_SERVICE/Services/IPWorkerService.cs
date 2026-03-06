@@ -11,7 +11,7 @@ namespace DLMS_SERVICE.Services
     public interface IIPWorkerService
     {
         Task StartAsync(CancellationToken stoppingToken);
-        Task EnqueueHourlyReadsAsync(List<CompteurEquipement> compteurs, DateTime readTime);
+        Task EnqueueHourlyReadsAsync(List<CompteurEquipement> compteurs, DateTime readTime, DateTime? cycleStartTime = null);
         Task EnqueueMissingReadsAsync(List<MissingReadInfo> missingReads);
         Task EnqueueCommandAsync(ActiveCommandInfo command);
     }
@@ -59,7 +59,7 @@ namespace DLMS_SERVICE.Services
             }
         }
 
-        public async Task EnqueueHourlyReadsAsync(List<CompteurEquipement> compteurs, DateTime readTime)
+        public async Task EnqueueHourlyReadsAsync(List<CompteurEquipement> compteurs, DateTime readTime, DateTime? cycleStartTime = null)
         {
             if (compteurs == null || !compteurs.Any())
                 return;
@@ -78,7 +78,8 @@ namespace DLMS_SERVICE.Services
                 Type = JobType.Hourly,
                 IP = ip,
                 Port = port,
-                CompteurEquipements = compteurs
+                CompteurEquipements = compteurs,
+                CycleStartTime = cycleStartTime ?? DateTime.Now
             };
 
             await _jobQueue.EnqueueAsync(job);
@@ -275,7 +276,7 @@ namespace DLMS_SERVICE.Services
                         // Utiliser CompteurEquipements si disponible, sinon CompteurEquipement (compatibilité)
                         var meters = job.CompteurEquipements ?? new List<CompteurEquipement> { job.CompteurEquipement };
                         await _parallelReadService.ProcessUmadGroupAsync(
-                            job.IP, job.Port, meters, ct);
+                            job.IP, job.Port, meters, ct, job.CycleStartTime);
                         break;
                         
                     case JobType.Missing:

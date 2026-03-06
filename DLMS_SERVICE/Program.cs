@@ -114,10 +114,13 @@ namespace DLMS_SERVICE
                 // DLMS Metrics Service - Monitoring performance
                 services.AddSingleton<IDLMSMetricsService, DLMSMetricsService>();
                 services.AddHostedService<MetricsReportingService>();
+
+                // Meter Health Tracker - Suivi santé compteurs pour timeout adaptatif et tri intelligent
+                services.AddSingleton<IMeterHealthTracker, MeterHealthTracker>();
                 
                 // Workers dédiés pour chaque type de tâche (mis à jour pour nouvelle architecture)
                 services.AddHostedService<HourlyReadsWorker>();
-                //services.AddHostedService<MissingReadsWorker>();
+                services.AddHostedService<MissingReadsWorker>();
                 //services.AddHostedService<ActiveCommandsWorker>();
                 
                 // Factory pour sessions Gurux thread-safe

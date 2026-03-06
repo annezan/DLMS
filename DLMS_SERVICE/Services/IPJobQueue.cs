@@ -24,6 +24,7 @@ namespace DLMS_SERVICE.Services
         public List<MissingReadInfo> MissingReads { get; set; }
         public ActiveCommandInfo Command { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.Now;
+        public DateTime? CycleStartTime { get; set; }
         public DateTime? StartedAt { get; set; }
         public DateTime? CompletedAt { get; set; }
     }

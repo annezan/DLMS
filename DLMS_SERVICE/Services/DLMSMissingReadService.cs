@@ -18,7 +18,7 @@ namespace DLMS_SERVICE.Services
     {
         private readonly ILogger<DLMSMissingReadService> _logger;
         private readonly IServiceProvider _serviceProvider;
-        private readonly TimeSpan _lookbackPeriod = TimeSpan.FromHours(744); // Regarder 744h en arrière
+        private readonly TimeSpan _lookbackPeriod = TimeSpan.FromHours(24); // Regarder 24h en arrière (optimisé depuis 744h)
 
         public DLMSMissingReadService(
             ILogger<DLMSMissingReadService> logger,

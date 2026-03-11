@@ -750,9 +750,18 @@ class Program
             return report;
         }
 
-        var totalReachableMeters = reachableGroups.Sum(g => g.Count());
+        // Reco 2: Sort meters per IP — cached meters first (faster reads, less concentrator load)
+        var sortedReachableGroups = reachableGroups.Select(g =>
+        {
+            var sorted = g.OrderByDescending(m =>
+                File.Exists(Path.Combine("associations", $"{m.Serial}_Read.xml")) ? 1 : 0)
+                .ToList();
+            return (Key: $"{g.First().Ip}:{g.First().Port}", Meters: sorted);
+        }).ToList();
+
+        var totalReachableMeters = sortedReachableGroups.Sum(g => g.Meters.Count);
         Console.WriteLine($"  Pool: {maxConcurrentIps} IPs max en parallele");
-        Console.WriteLine($"  Lancement de {totalReachableMeters} lectures sur {reachableGroups.Count} IPs (1 TCP/IP, ReadList)...");
+        Console.WriteLine($"  Lancement de {totalReachableMeters} lectures sur {sortedReachableGroups.Count} IPs (1 TCP/IP, ReadList)...");
         Console.WriteLine();
 
         // Pool adaptatif : ajuste le nombre d'IPs traitées simultanément
@@ -763,14 +772,15 @@ class Program
         var consoleLock = new object();
         int completedIps = 0;
 
-        var tasks = reachableGroups.Select(group => Task.Run(async () =>
+        var tasks = sortedReachableGroups.Select(entry => Task.Run(async () =>
         {
             await adaptivePool.WaitAsync();
             try
             {
-                var firstMeter = group.First();
+                var meterList = entry.Meters;
+                var firstMeter = meterList.First();
                 var ipLabel = $"{firstMeter.Ip}:{firstMeter.Port}";
-                var meterCount = group.Count();
+                var meterCount = meterList.Count;
                 var ipResult = new IpGroupResult
                 {
                     Ip = firstMeter.Ip,
@@ -780,9 +790,11 @@ class Program
                 // Limit concurrency per concentrator (1 session at a time — UMAD concentrators only support 1 active HDLC association)
                 var semaphore = new SemaphoreSlim(1, 1);
 
-                // Early abort: if N consecutive failures on this IP, skip remaining meters
+                // Early abort: if N consecutive failures on this IP, pause+retry before abandoning
                 int consecutiveFailures = 0;
                 const int maxConsecutiveFailures = 3;
+                int pauseCount = 0;           // Reco 1: max 1 pause per IP before hard abandon
+                const int maxPauses = 1;
                 var aborted = false;
 
                 // 1 seule session TCP par IP groupe (reutilisee par tous les compteurs)
@@ -806,7 +818,7 @@ class Program
                     var ipNum = Interlocked.Increment(ref completedIps);
                     lock (consoleLock)
                     {
-                        Console.WriteLine($"  [IP {ipNum}/{reachableGroups.Count}] {ipLabel} : TCP ECHEC ({tcpSw.ElapsedMilliseconds}ms)");
+                        Console.WriteLine($"  [IP {ipNum}/{sortedReachableGroups.Count}] {ipLabel} : TCP ECHEC ({tcpSw.ElapsedMilliseconds}ms)");
                     }
                     return ipResult;
                 }
@@ -815,7 +827,7 @@ class Program
 
                 try
                 {
-                    var meterTasks = group.Select(meter => Task.Run(async () =>
+                    var meterTasks = meterList.Select(meter => Task.Run(async () =>
                     {
                         // Check early abort before waiting for semaphore
                         if (Volatile.Read(ref aborted))
@@ -823,7 +835,7 @@ class Program
                             return new MeterResult
                             {
                                 Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
-                                Error = $"Ignore (IP abandonnee apres {maxConsecutiveFailures} echecs consecutifs)"
+                                Error = $"Ignore (IP abandonnee)"
                             };
                         }
 
@@ -836,15 +848,20 @@ class Program
                             return new MeterResult
                             {
                                 Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
-                                Error = $"Ignore (IP abandonnee apres {maxConsecutiveFailures} echecs consecutifs)"
+                                Error = $"Ignore (IP abandonnee)"
                             };
                         }
 
                         Console.WriteLine($"    [{meter.Ip}] Debut lecture {meter.Serial} (sequentiel)");
+
+                        // Reco 3: Dynamic timeout — 180s for cached meters, 300s for uncached
+                        var hasCacheFile = File.Exists(Path.Combine("associations", $"{meter.Serial}_Read.xml"));
+                        var timeoutSeconds = hasCacheFile ? 180 : 300;
+
                         try
                         {
                             var meterResult = await ReadSingleMeter(sharedSession, meter, keyService)
-                                .WaitAsync(TimeSpan.FromSeconds(180));
+                                .WaitAsync(TimeSpan.FromSeconds(timeoutSeconds));
 
                             if (meterResult.Success)
                             {
@@ -855,8 +872,20 @@ class Program
                                 var failures = Interlocked.Increment(ref consecutiveFailures);
                                 if (failures >= maxConsecutiveFailures)
                                 {
-                                    Volatile.Write(ref aborted, true);
-                                    Console.WriteLine($"    [{meter.Ip}] ABANDON IP apres {maxConsecutiveFailures} echecs consecutifs");
+                                    var pauses = Interlocked.Increment(ref pauseCount);
+                                    if (pauses <= maxPauses)
+                                    {
+                                        // Reco 1: Pause 30s then retry — concentrator may recover
+                                        Console.WriteLine($"    [{meter.Ip}] PAUSE 30s apres {maxConsecutiveFailures} echecs consecutifs (cooldown concentrateur)");
+                                        await Task.Delay(TimeSpan.FromSeconds(30));
+                                        Interlocked.Exchange(ref consecutiveFailures, 0);
+                                    }
+                                    else
+                                    {
+                                        // Already paused once and still failing — hard abandon
+                                        Volatile.Write(ref aborted, true);
+                                        Console.WriteLine($"    [{meter.Ip}] ABANDON IP apres {maxConsecutiveFailures} echecs consecutifs (deja pause {maxPauses}x)");
+                                    }
                                 }
                             }
 
@@ -867,13 +896,23 @@ class Program
                             var failures = Interlocked.Increment(ref consecutiveFailures);
                             if (failures >= maxConsecutiveFailures)
                             {
-                                Volatile.Write(ref aborted, true);
-                                Console.WriteLine($"    [{meter.Ip}] ABANDON IP apres {maxConsecutiveFailures} echecs consecutifs");
+                                var pauses = Interlocked.Increment(ref pauseCount);
+                                if (pauses <= maxPauses)
+                                {
+                                    Console.WriteLine($"    [{meter.Ip}] PAUSE 30s apres {maxConsecutiveFailures} echecs consecutifs (cooldown concentrateur)");
+                                    await Task.Delay(TimeSpan.FromSeconds(30));
+                                    Interlocked.Exchange(ref consecutiveFailures, 0);
+                                }
+                                else
+                                {
+                                    Volatile.Write(ref aborted, true);
+                                    Console.WriteLine($"    [{meter.Ip}] ABANDON IP apres {maxConsecutiveFailures} echecs consecutifs (deja pause {maxPauses}x)");
+                                }
                             }
                             return new MeterResult
                             {
                                 Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
-                                Error = "Timeout global (180s)"
+                                Error = $"Timeout global ({timeoutSeconds}s)"
                             };
                         }
                         finally
@@ -907,7 +946,7 @@ class Program
 
                 lock (consoleLock)
                 {
-                    Console.WriteLine($"  [IP {ipNum2}/{reachableGroups.Count}] {ipLabel} : {ok}/{meterCount} OK{(avgReadS > 0 ? $" (moy lecture: {avgReadS:F0}s)" : "")}");
+                    Console.WriteLine($"  [IP {ipNum2}/{sortedReachableGroups.Count}] {ipLabel} : {ok}/{meterCount} OK{(avgReadS > 0 ? $" (moy lecture: {avgReadS:F0}s)" : "")}");
                     foreach (var mr in ipResult.MeterResults)
                     {
                         if (mr.Success)

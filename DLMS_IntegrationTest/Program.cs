@@ -440,8 +440,26 @@ class Program
 
             if (readResult == "Lecture impossible")
             {
-                result.Error = "Lecture impossible";
-                return result;
+                // Retry: disconnect HDLC, re-associate, re-read
+                Console.WriteLine($"    [{meter.Ip}] {meter.Serial} retry apres echec lecture");
+                try { session.Reader?.Disconnect(); } catch { }
+
+                session.AssociationLoaded = false;
+                session.InitializeMeterClient(meterParams, waitTime: 5000, retryCount: 2);
+
+                var retrySw = Stopwatch.StartNew();
+                session.Reader!.InitializeConnection();
+                var retryResult = await reader.ReadListAsync(session);
+                retrySw.Stop();
+                result.ReadMs += retrySw.ElapsedMilliseconds;
+
+                if (retryResult == "Lecture impossible")
+                {
+                    result.Error = "Lecture impossible (apres retry)";
+                    return result;
+                }
+
+                readResult = retryResult;
             }
 
             result.Success = true;

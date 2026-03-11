@@ -73,6 +73,7 @@ namespace DLMS_COMMUNICATION.Reader
             }
             catch(Exception ex)
             {
+                _logger?.LogWarning(ex, "ReadAsync echec: {Message}", ex.Message);
                 return "Lecture impossible";
             }
         }
@@ -142,6 +143,7 @@ namespace DLMS_COMMUNICATION.Reader
             }
             catch (Exception ex)
             {
+                _logger?.LogWarning(ex, "ReadListAsync echec: {Message}", ex.Message);
                 return "Lecture impossible";
             }
         }
@@ -223,6 +225,7 @@ namespace DLMS_COMMUNICATION.Reader
             }
             catch (Exception ex)
             {
+                _logger?.LogWarning(ex, "ReadRowsByRangeAsync echec: {Message}", ex.Message);
                 return "Lecture impossible";
             }
         }

@@ -34,7 +34,21 @@ namespace DLMS_COMMUNICATION.Reader
 
                 if (!session.AssociationLoaded)
                 {
-                    session.Reader.GetAssociationView(session.OutputFile);
+                    bool loadedFromFile = false;
+                    if (!string.IsNullOrEmpty(session.OutputFile))
+                    {
+                        try
+                        {
+                            session.Client.Objects.Clear();
+                            session.Client.Objects.AddRange(GXDLMSObjectCollection.Load(session.OutputFile));
+                            loadedFromFile = true;
+                        }
+                        catch { }
+                    }
+                    if (!loadedFromFile)
+                    {
+                        session.Reader.GetAssociationView(session.OutputFile);
+                    }
                     session.AssociationLoaded = true;
                 }
 
@@ -63,6 +77,75 @@ namespace DLMS_COMMUNICATION.Reader
             }
         }
 
+        public async Task<string> ReadListAsync(IDLMSCommunicationSession session)
+        {
+            try
+            {
+                if (session.ReadObjects.Count == 0)
+                    return "Lecture impossible";
+
+                if (!session.AssociationLoaded)
+                {
+                    bool loadedFromFile = false;
+                    if (!string.IsNullOrEmpty(session.OutputFile))
+                    {
+                        try
+                        {
+                            session.Client.Objects.Clear();
+                            session.Client.Objects.AddRange(GXDLMSObjectCollection.Load(session.OutputFile));
+                            loadedFromFile = true;
+                        }
+                        catch { }
+                    }
+                    if (!loadedFromFile)
+                    {
+                        session.Reader.GetAssociationView(session.OutputFile);
+                    }
+                    session.AssociationLoaded = true;
+                }
+
+                // Build list of (GXDLMSObject, attributeIndex) pairs
+                var objectsToRead = new List<KeyValuePair<GXDLMSObject, int>>();
+                foreach (var it in session.ReadObjects)
+                {
+                    var obj = session.Client.Objects.FindByLN(ObjectType.None, it.Key);
+                    if (obj != null)
+                        objectsToRead.Add(new KeyValuePair<GXDLMSObject, int>(obj, it.Value));
+                }
+
+                if (objectsToRead.Count == 0)
+                    return "Lecture impossible";
+
+                // Use ReadList if meter supports MultipleReferences, else fallback
+                if (objectsToRead.Count > 1 &&
+                    (session.Client.NegotiatedConformance & Conformance.MultipleReferences) != 0)
+                {
+                    session.Reader.ReadList(objectsToRead);
+                }
+                else
+                {
+                    foreach (var kv in objectsToRead)
+                        session.Reader.Read(kv.Key, kv.Value);
+                }
+
+                // Extract values
+                var dict = new Dictionary<string, object>();
+                foreach (var kv in objectsToRead)
+                {
+                    var val = kv.Key.GetValues()[kv.Value - 1]; // attribute index is 1-based
+                    dict[kv.Key.LogicalName] = val is byte[] b
+                        ? Encoding.UTF8.GetString(b).Trim()
+                        : val?.ToString()?.Trim();
+                }
+
+                return JsonConvert.SerializeObject(dict);
+            }
+            catch (Exception ex)
+            {
+                return "Lecture impossible";
+            }
+        }
+
         public async Task<string> ReadRowsByRangeAsync(IDLMSCommunicationSession session, string datestart, string dateend)
         {
             try
@@ -78,7 +161,21 @@ namespace DLMS_COMMUNICATION.Reader
 
                 if (!session.AssociationLoaded)
                 {
-                    session.Reader.GetAssociationView(session.OutputFile);
+                    bool loadedFromFile = false;
+                    if (!string.IsNullOrEmpty(session.OutputFile))
+                    {
+                        try
+                        {
+                            session.Client.Objects.Clear();
+                            session.Client.Objects.AddRange(GXDLMSObjectCollection.Load(session.OutputFile));
+                            loadedFromFile = true;
+                        }
+                        catch { }
+                    }
+                    if (!loadedFromFile)
+                    {
+                        session.Reader.GetAssociationView(session.OutputFile);
+                    }
                     session.AssociationLoaded = true;
                 }
 

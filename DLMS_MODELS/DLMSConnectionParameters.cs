@@ -17,5 +17,6 @@ namespace DLMS_MODELS
         public TraceLevel Trace { get; set; } = TraceLevel.Verbose;
         public string? OutputFile { get; set; }
         public string? InvocationCounter { get; set; }
+        public bool UseGbt { get; set; } = false;
     }
 }

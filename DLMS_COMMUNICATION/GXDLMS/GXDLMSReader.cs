@@ -821,16 +821,19 @@ namespace Gurux.DLMS.Reader
         /// </summary>
         public void InitializeConnection()
         {
-            Console.WriteLine("Standard: " + Client.Standard);
-            if (Client.Ciphering.Security != Security.None)
+            if (Trace > TraceLevel.Off)
             {
-                Console.WriteLine("Security: " + Client.Ciphering.Security);
-                Console.WriteLine("System title: " + GXCommon.ToHex(Client.Ciphering.SystemTitle, true));
-                Console.WriteLine("Authentication key: " + GXCommon.ToHex(Client.Ciphering.AuthenticationKey, true));
-                Console.WriteLine("Block cipher key " + GXCommon.ToHex(Client.Ciphering.BlockCipherKey, true));
-                if (Client.Ciphering.DedicatedKey != null)
+                Console.WriteLine("Standard: " + Client.Standard);
+                if (Client.Ciphering.Security != Security.None)
                 {
-                    Console.WriteLine("Dedicated key: " + GXCommon.ToHex(Client.Ciphering.DedicatedKey, true));
+                    Console.WriteLine("Security: " + Client.Ciphering.Security);
+                    Console.WriteLine("System title: " + GXCommon.ToHex(Client.Ciphering.SystemTitle, true));
+                    Console.WriteLine("Authentication key: " + GXCommon.ToHex(Client.Ciphering.AuthenticationKey, true));
+                    Console.WriteLine("Block cipher key " + GXCommon.ToHex(Client.Ciphering.BlockCipherKey, true));
+                    if (Client.Ciphering.DedicatedKey != null)
+                    {
+                        Console.WriteLine("Dedicated key: " + GXCommon.ToHex(Client.Ciphering.DedicatedKey, true));
+                    }
                 }
             }
             UpdateFrameCounter();
@@ -857,7 +860,14 @@ namespace Gurux.DLMS.Reader
                 }
                 //Parse reply.
                 Client.ParseAAREResponse(reply.Data);
-                Console.WriteLine("Conformance: " + Client.NegotiatedConformance);
+                if (Trace > TraceLevel.Off)
+                {
+                    Console.WriteLine("Conformance: " + Client.NegotiatedConformance);
+                    if ((Client.NegotiatedConformance & Conformance.GeneralBlockTransfer) != 0)
+                        Console.WriteLine("GBT: NEGOTIATED");
+                    else if ((Client.ProposedConformance & Conformance.GeneralBlockTransfer) != 0)
+                        Console.WriteLine("GBT: proposed but NOT negotiated (meter unsupported)");
+                }
                 reply.Clear();
                 //Get challenge Is HLS authentication is used.
                 if (Client.Authentication > Authentication.Low)
@@ -948,25 +958,18 @@ namespace Gurux.DLMS.Reader
         {
             if (outputFile != null)
             {
-                //Save Association view to the cache so it is not needed to retrieve every time.
                 if (File.Exists(outputFile))
                 {
                     try
                     {
-                         if (File.Exists(outputFile))
-                         {
-                            File.Delete(outputFile);
-                         }
-                        //Client.Objects.Clear();
-                        //Client.Objects.AddRange(GXDLMSObjectCollection.Load(outputFile));
-                        //return false;
+                        Client.Objects.Clear();
+                        Client.Objects.AddRange(GXDLMSObjectCollection.Load(outputFile));
+                        return false; // Chargé depuis cache, pas de round-trip
                     }
-                    catch (Exception ex)
+                    catch (Exception)
                     {
-                        //if (File.Exists(outputFile))
-                        //{
-                        //    File.Delete(outputFile);
-                        //}
+                        try { File.Delete(outputFile); } catch { }
+                        // Fichier corrompu → on continue avec le fetch meter
                     }
                 }
             }

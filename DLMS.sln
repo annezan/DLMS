@@ -21,6 +21,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DLMS_UTILITIES", "DLMS_UTIL
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DLMS_SERVICE.Tests", "DLMS_SERVICE.Tests\DLMS_SERVICE.Tests.csproj", "{844FC971-8A10-4EA1-A1BB-A62E36A42B37}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DLMS_IntegrationTest", "DLMS_IntegrationTest\DLMS_IntegrationTest.csproj", "{8EAA83A2-CECE-44C6-AE16-8B43AA4F07D8}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -63,6 +65,10 @@ Global
 		{844FC971-8A10-4EA1-A1BB-A62E36A42B37}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{844FC971-8A10-4EA1-A1BB-A62E36A42B37}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{844FC971-8A10-4EA1-A1BB-A62E36A42B37}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8EAA83A2-CECE-44C6-AE16-8B43AA4F07D8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8EAA83A2-CECE-44C6-AE16-8B43AA4F07D8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8EAA83A2-CECE-44C6-AE16-8B43AA4F07D8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8EAA83A2-CECE-44C6-AE16-8B43AA4F07D8}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

@@ -186,6 +186,18 @@ namespace DLMS_SERVICE.Services
 
                 AssociationLoaded = false;
 
+                // OutputFile par compteur pour le cache association
+                var mClientType = meterParams.ClientAddress?.ToLower() switch
+                {
+                    "public" => "public", "read" => "Read",
+                    "managed" => "Managed", "fwu" => "fwu", _ => "Read"
+                };
+                OutputFile = !string.IsNullOrEmpty(meterParams.OutputFile)
+                    ? meterParams.OutputFile
+                    : (!string.IsNullOrEmpty(meterParams.SerialNumber)
+                        ? Path.Combine("associations", $"{meterParams.SerialNumber}_{mClientType}.xml")
+                        : $"{mClientType}.xml");
+
                 _logger.LogDebug("✅ Client DLMS initialisé pour {Serial} (WaitTime={WaitTime}ms, RetryCount={RetryCount})",
                     meterParams.SerialNumber, Reader.WaitTime, Reader.RetryCount);
             }

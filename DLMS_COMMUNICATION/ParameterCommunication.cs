@@ -707,6 +707,12 @@ namespace DLMS_COMMUNICATION
                 {
                     client.Ciphering.BlockCipherKey = GXCommon.HexToBytes(parameters.UnicastKey);
                 }
+
+                // GBT (General Block Transfer) — propose le flag au compteur
+                if (parameters.UseGbt)
+                {
+                    client.ProposedConformance |= Conformance.GeneralBlockTransfer;
+                }
             }
             catch (Exception ex)
             {

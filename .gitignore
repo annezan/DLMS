@@ -402,3 +402,17 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Application settings (contain credentials/connection strings)
+**/appsettings.json
+**/appsettings.*.json
+!**/appsettings.example.json
+
+# OS files
+.DS_Store
+
+# Association view cache
+associations/
+
+# Publish artifacts
+publish.zip

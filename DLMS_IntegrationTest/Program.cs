@@ -1553,6 +1553,90 @@ class Program
         }
     }
 
+    // ===== Multi-pass report methods =====
+
+    private static void PrintPassSummary(PassResult pass)
+    {
+        var durationMin = pass.ElapsedMs / 60000.0;
+        var throughput = durationMin > 0 ? pass.Succeeded / durationMin : 0;
+        var rate = pass.Results.Count > 0 ? (double)pass.Succeeded / pass.Results.Count * 100 : 0;
+
+        Console.WriteLine();
+        Console.WriteLine($"=== PASS {pass.PassNumber}/3 TERMINE ({durationMin:F1} min) ===");
+        Console.WriteLine($"  In scope       : {pass.InScope} compteurs");
+        Console.WriteLine($"  Lectures OK    : {pass.Succeeded} ({rate:F1}%)");
+        Console.WriteLine($"  Echecs         : {pass.Failed}");
+        Console.WriteLine($"  Differes       : {pass.DeferredCount} (canary/abandon/budget)");
+        Console.WriteLine($"  IPs differees  : {pass.DeferredIps.Count}");
+        Console.WriteLine($"  Debit          : {throughput:F1} compteurs/min");
+        Console.WriteLine();
+    }
+
+    private static void PrintMultiPassReport(MultiPassReport report)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"=== RAPPORT MULTI-PASS ({report.Passes.Count} passes, {report.TotalElapsedMs / 60000.0:F1} min) ===");
+        Console.WriteLine();
+
+        // Per-pass table
+        Console.WriteLine($"  {"Pass",-8} {"Duree",-10} {"In Scope",-10} {"OK",-6} {"Taux",-8} {"Debit",-12}");
+        Console.WriteLine($"  {new string('-', 54)}");
+
+        foreach (var pass in report.Passes)
+        {
+            var durationMin = pass.ElapsedMs / 60000.0;
+            var throughput = durationMin > 0 ? pass.Succeeded / durationMin : 0;
+            var rate = pass.Results.Count > 0 ? (double)pass.Succeeded / pass.Results.Count * 100 : 0;
+
+            Console.WriteLine($"  Pass {pass.PassNumber,-3} {durationMin,-9:F1}m {pass.InScope,-10} {pass.Succeeded,-6} {rate,-7:F1}% {throughput,-11:F1}/min");
+        }
+
+        Console.WriteLine($"  {new string('-', 54)}");
+        var totalMin = report.TotalReadingMs / 60000.0;
+        var totalThroughput = totalMin > 0 ? report.TotalSucceeded / totalMin : 0;
+        var totalRate = report.TotalMeters > 0 ? (double)report.TotalSucceeded / report.TotalMeters * 100 : 0;
+        Console.WriteLine($"  {"TOTAL",-8} {totalMin,-9:F1}m {report.TotalMeters,-10} {report.TotalSucceeded,-6} {totalRate,-7:F1}% {totalThroughput,-11:F1}/min");
+        Console.WriteLine($"  {"Pauses",-8} +{report.TotalPauseMs / 60000.0:F1}m");
+        Console.WriteLine();
+
+        // Unread breakdown
+        if (report.UnreadByReason.Count > 0)
+        {
+            var totalUnread = report.TotalFailed;
+            Console.WriteLine($"  Compteurs non lus ({totalUnread}) :");
+            foreach (var kv in report.UnreadByReason.OrderByDescending(kv => kv.Value.Count))
+            {
+                var pct = report.TotalMeters > 0 ? (double)kv.Value.Count / report.TotalMeters * 100 : 0;
+                Console.WriteLine($"    {kv.Key,-25} : {kv.Value.Count,4} ({pct:F1}%)");
+            }
+            Console.WriteLine();
+        }
+
+        // Per-IP concentrator stats
+        Console.WriteLine("=== STATISTIQUES PAR CONCENTRATEUR ===");
+        var allResults = report.AllResults;
+        var ipStats = allResults
+            .GroupBy(r => $"{r.Ip}:{r.Port}")
+            .Select(g => new
+            {
+                Ip = g.Key,
+                Total = g.Count(),
+                Ok = g.Count(r => r.Success),
+                Fail = g.Count(r => !r.Success),
+                AvgReadMs = g.Where(r => r.Success && r.ReadMs > 0).Select(r => (double)r.ReadMs).DefaultIfEmpty(0).Average()
+            })
+            .OrderBy(s => s.Ip);
+
+        Console.WriteLine($"  {"IP",-25} {"Total",6} {"OK",6} {"Echec",6} {"Taux",6} {"Lecture Moy",12}");
+        Console.WriteLine($"  {new string('-', 61)}");
+        foreach (var s in ipStats)
+        {
+            var rate2 = s.Total > 0 ? (double)s.Ok / s.Total * 100 : 0;
+            Console.WriteLine($"  {s.Ip,-25} {s.Total,6} {s.Ok,6} {s.Fail,6} {rate2,5:F0}% {s.AvgReadMs,10:F0}ms");
+        }
+        Console.WriteLine();
+    }
+
     // ===== RunSingleMeterTest (original behavior) =====
 
     private static async Task<int> RunSingleMeterTest(

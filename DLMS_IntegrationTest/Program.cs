@@ -293,6 +293,9 @@ class Program
     {
         var totalSw = Stopwatch.StartNew();
 
+        // Prevent thread pool starvation from synchronous Gurux HDLC calls
+        ThreadPool.SetMinThreads(50, 50);
+
         Console.WriteLine("=== Test d'integration DLMS/COSEM ===");
         Console.WriteLine();
 
@@ -739,14 +742,14 @@ class Program
 
     private static async Task<MultiPassReport> RunParallelTest(
         List<MeterInfo> meters, DbContextOptions<DLMSDBContext> dbOptions,
-        long dbLoadMs, int totalMeters, int totalIps, int maxConcurrentIps = 10)
+        long dbLoadMs, int totalMeters, int totalIps, int maxConcurrentIps = 8)
     {
         var multiPassReport = new MultiPassReport { TotalMeters = meters.Count };
         var successfulSerials = new HashSet<string>();
         var totalSw = Stopwatch.StartNew();
-        const int GlobalCeilingSeconds = 3000; // 50 minutes hard ceiling
+        const int GlobalCeilingSeconds = 3600; // 60 minutes hard ceiling
 
-        Console.WriteLine($"=== Mode MULTI-PASS (pool={maxConcurrentIps} IPs, 3 passes, budget 50 min) ===");
+        Console.WriteLine($"=== Mode MULTI-PASS (pool={maxConcurrentIps} IPs, 3 passes, budget 60 min) ===");
         Console.WriteLine();
 
         var contextFactory = new SimpleDbContextFactory(dbOptions);
@@ -762,11 +765,11 @@ class Program
 
         var passConfigs = new[]
         {
-            new PassConfig(1, budget: 900,  canary: 30, cached: 60,  uncached: 90,
+            new PassConfig(1, budget: 1200, canary: 180, cached: 180, uncached: 300,
                            maxFails: 2, cooldownCount: 0, cooldownSeconds: 0,  pause: 300),
-            new PassConfig(2, budget: 600,  canary: 45, cached: 90,  uncached: 120,
+            new PassConfig(2, budget: 900,  canary: 300, cached: 240, uncached: 360,
                            maxFails: 3, cooldownCount: 1, cooldownSeconds: 15, pause: 300),
-            new PassConfig(3, budget: 480,  canary: 60, cached: 120, uncached: 180,
+            new PassConfig(3, budget: 600,  canary: 420, cached: 300, uncached: 420,
                            maxFails: 5, cooldownCount: 1, cooldownSeconds: 30, pause: 0),
         };
 
@@ -1600,7 +1603,7 @@ class Program
     {
         var raw = (int)(canaryLatencyMs / 1000.0 * 2.5);
         var ceiling = hasCacheFile ? config.CachedTimeoutSeconds : config.UncachedTimeoutSeconds;
-        return Math.Clamp(raw, 45, ceiling);
+        return Math.Clamp(raw, 90, ceiling);
     }
 
     private static async Task<List<(string Key, bool Reachable, long Ms)>> ParallelTcpScan(

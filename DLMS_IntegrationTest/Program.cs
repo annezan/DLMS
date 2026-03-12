@@ -87,6 +87,90 @@ class TestReport
     public ConcentratorStats? Stats { get; set; }
 }
 
+// ===== Multi-pass configuration =====
+
+class PassConfig
+{
+    public int PassNumber;
+    public int BudgetSeconds;
+    public int CanaryTimeoutSeconds;
+    public int CachedTimeoutSeconds;
+    public int UncachedTimeoutSeconds;
+    public int MaxConsecutiveFailures;
+    public int CooldownCount;
+    public int CooldownSeconds;
+    public int PauseAfterSeconds;
+
+    public const int TcpScanTimeoutSeconds = 8;
+
+    public PassConfig(int passNumber, int budget, int canary, int cached,
+        int uncached, int maxFails, int cooldownCount, int cooldownSeconds, int pause)
+    {
+        PassNumber = passNumber;
+        BudgetSeconds = budget;
+        CanaryTimeoutSeconds = canary;
+        CachedTimeoutSeconds = cached;
+        UncachedTimeoutSeconds = uncached;
+        MaxConsecutiveFailures = maxFails;
+        CooldownCount = cooldownCount;
+        CooldownSeconds = cooldownSeconds;
+        PauseAfterSeconds = pause;
+    }
+}
+
+class PassBudget
+{
+    private readonly Stopwatch _sw = Stopwatch.StartNew();
+    private readonly int _budgetSeconds;
+
+    public PassBudget(int budgetSeconds) => _budgetSeconds = budgetSeconds;
+
+    public double TimeLeftSeconds => _budgetSeconds - _sw.Elapsed.TotalSeconds;
+    public bool IsExpired => TimeLeftSeconds < 30;
+    public long ElapsedMs => _sw.ElapsedMilliseconds;
+
+    public int ClampTimeout(int desiredTimeout)
+    {
+        var maxAllowed = (int)TimeLeftSeconds - 5;
+        if (maxAllowed < 15) return -1;
+        return Math.Min(desiredTimeout, maxAllowed);
+    }
+}
+
+class PassResult
+{
+    public int PassNumber;
+    public List<MeterResult> Results = new();
+    public ConcurrentBag<MeterInfo> DeferredMeters = new();
+    public ConcurrentDictionary<string, byte> DeferredIps = new();
+    public long ElapsedMs;
+
+    public int Succeeded => Results.Count(r => r.Success);
+    public int Failed => Results.Count(r => !r.Success);
+    public int DeferredCount => DeferredMeters.Count;
+    public int InScope => Results.Count + DeferredCount;
+
+    public void DeferIp(string ipKey) => DeferredIps.TryAdd(ipKey, 0);
+    public void DeferMeter(MeterInfo m) => DeferredMeters.Add(m);
+    public HashSet<string> GetDeferredIpSet() => DeferredIps.Keys.ToHashSet();
+}
+
+class MultiPassReport
+{
+    public List<PassResult> Passes = new();
+    public long TotalElapsedMs;
+    public long TotalReadingMs;
+    public long TotalPauseMs;
+    public int TotalMeters;
+
+    public int TotalSucceeded => Passes.Sum(p => p.Succeeded);
+    public int TotalFailed => TotalMeters - TotalSucceeded;
+
+    public List<MeterResult> AllResults => Passes.SelectMany(p => p.Results).ToList();
+
+    public Dictionary<string, List<string>> UnreadByReason = new();
+}
+
 // ===== KPI monitoring =====
 
 class ConcentratorStats
@@ -796,6 +880,7 @@ class Program
                 int pauseCount = 0;           // Reco 1: max 1 pause per IP before hard abandon
                 const int maxPauses = 1;
                 var aborted = false;
+                int ipHasFailure = 0;         // Reco 3: flag to reduce timeout after first failure on IP
 
                 // 1 seule session TCP par IP groupe (reutilisee par tous les compteurs)
                 var transportParams = new DLMSConnectionParameters
@@ -852,11 +937,21 @@ class Program
                             };
                         }
 
-                        Console.WriteLine($"    [{meter.Ip}] Debut lecture {meter.Serial} (sequentiel)");
-
-                        // Reco 3: Dynamic timeout — 180s for cached meters, 300s for uncached
+                        // Reco 3: Dynamic timeout based on cache + IP failure state
                         var hasCacheFile = File.Exists(Path.Combine("associations", $"{meter.Serial}_Read.xml"));
-                        var timeoutSeconds = hasCacheFile ? 180 : 300;
+                        int timeoutSeconds;
+                        if (Volatile.Read(ref ipHasFailure) == 1)
+                        {
+                            // IP already had failures — reduce timeout to avoid wasting time on dying concentrators
+                            timeoutSeconds = hasCacheFile ? 90 : 120;
+                        }
+                        else
+                        {
+                            timeoutSeconds = hasCacheFile ? 180 : 300;
+                        }
+
+                        Console.WriteLine($"    [{meter.Ip}] Debut lecture {meter.Serial} (timeout:{timeoutSeconds}s{(Volatile.Read(ref ipHasFailure) == 1 ? ",reduced" : "")})");
+
 
                         try
                         {
@@ -869,6 +964,7 @@ class Program
                             }
                             else
                             {
+                                Interlocked.Exchange(ref ipHasFailure, 1); // Reco 3: flag for reduced timeout
                                 var failures = Interlocked.Increment(ref consecutiveFailures);
                                 if (failures >= maxConsecutiveFailures)
                                 {
@@ -893,6 +989,7 @@ class Program
                         }
                         catch (TimeoutException)
                         {
+                            Interlocked.Exchange(ref ipHasFailure, 1); // Reco 3: flag for reduced timeout
                             var failures = Interlocked.Increment(ref consecutiveFailures);
                             if (failures >= maxConsecutiveFailures)
                             {

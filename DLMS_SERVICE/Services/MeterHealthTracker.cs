@@ -27,6 +27,7 @@ namespace DLMS_SERVICE.Services
         MeterHealthInfo GetHealthInfo(string meterSerial);
         int GetPriorityScore(string meterSerial);
         MeterPerformanceCategory GetCategory(string meterSerial);
+        bool HasAssociationCache(string serial);
     }
 
     public class MeterHealthTracker : IMeterHealthTracker
@@ -160,6 +161,14 @@ namespace DLMS_SERVICE.Services
                 // Medium: everything else
                 return MeterPerformanceCategory.Medium;
             }
+        }
+
+        public bool HasAssociationCache(string serial)
+        {
+            if (string.IsNullOrEmpty(serial)) return false;
+            var category = GetCategory(serial);
+            return category == MeterPerformanceCategory.Fast
+                || category == MeterPerformanceCategory.Medium;
         }
 
         private class MeterStats

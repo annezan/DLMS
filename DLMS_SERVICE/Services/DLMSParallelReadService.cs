@@ -11,6 +11,7 @@ using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using System.Collections.Concurrent;
 using System.IO.Ports;
+using DLMS_SERVICE.Services.MultiPass;
 
 namespace DLMS_SERVICE.Services
 {
@@ -19,6 +20,16 @@ namespace DLMS_SERVICE.Services
         Task ProcessUmadGroupAsync(string ip, int port, List<CompteurEquipement> meters, CancellationToken ct, DateTime? cycleStartTime = null);
         Task ProcessUmadMissingReadsGroupAsync(string ip, int port, List<MissingReadInfo> missingReads, CancellationToken ct);
         Task ProcessUmadCommandGroupAsync(string ip, int port, List<ActiveCommandInfo> commands, CancellationToken ct);
+
+        /// <summary>
+        /// Reads a single meter on an already-open UMAD session. Used by the multi-pass orchestrator.
+        /// Returns a MeterReadOutcome with timing metrics and success/failure status.
+        /// </summary>
+        Task<MultiPass.MeterReadOutcome> ReadSingleMeterOnSessionAsync(
+            IDLMSCommunicationSession session,
+            CompteurEquipement meter,
+            TimeSpan timeout,
+            CancellationToken ct);
     }
 
     public class DLMSParallelReadService : IDLMSParallelReadService
@@ -649,6 +660,153 @@ namespace DLMS_SERVICE.Services
 
             _logger.LogInformation("✅ Commande {CommandId} exécutée avec succès pour {Numero}", 
                 command.CommandId, command.NumeroCompteur);
+        }
+
+        public async Task<MeterReadOutcome> ReadSingleMeterOnSessionAsync(
+            IDLMSCommunicationSession session,
+            CompteurEquipement meter,
+            TimeSpan timeout,
+            CancellationToken ct)
+        {
+            var serial = meter.Compteur?.NumeroCompteur ?? "";
+            var outcome = new MeterReadOutcome
+            {
+                Serial = serial,
+                Ip = meter.Equipement?.AdresseIp ?? "",
+                Port = meter.Equipement?.Port ?? "",
+                CompteurEquipementId = meter.Id,
+                TimeoutApplied = (int)timeout.TotalSeconds
+            };
+
+            var totalSw = System.Diagnostics.Stopwatch.StartNew();
+
+            try
+            {
+                // 1. Retrieve keys
+                var keySw = System.Diagnostics.Stopwatch.StartNew();
+                var keys = await _keyService.GetKeysAsync("read", serial, "read");
+                keySw.Stop();
+                outcome.KeysRetrievalMs = keySw.ElapsedMilliseconds;
+
+                if (keys == null || !keys.IsValid)
+                {
+                    outcome.Error = "Cles DLMS invalides ou manquantes";
+                    outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.CleManquante;
+                    return outcome;
+                }
+
+                // 2. Initialize meter client
+                var meterParams = new DLMSConnectionParameters
+                {
+                    ClientAddress = "read",
+                    SerialNumber = serial,
+                    Password = keys.Password,
+                    AuthenticationKey = keys.AuthenticationKey,
+                    UnicastKey = keys.UnicastKey,
+                    InterfaceType = "HDLC"
+                };
+
+                // 3. HDLC association with timeout
+                using var globalTimeoutCts = new CancellationTokenSource(timeout);
+                using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, globalTimeoutCts.Token);
+
+                var hdlcSw = System.Diagnostics.Stopwatch.StartNew();
+                var connectionSuccess = false;
+
+                session.InitializeMeterClient(meterParams, waitTime: 3000, retryCount: 1);
+
+                await Task.Run(() =>
+                {
+                    try
+                    {
+                        session.Reader!.InitializeConnection();
+                        connectionSuccess = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Association DLMS echouee {Serial}", serial);
+                    }
+                }, combinedCts.Token);
+
+                hdlcSw.Stop();
+                outcome.HdlcMs = hdlcSw.ElapsedMilliseconds;
+
+                if (!connectionSuccess)
+                {
+                    outcome.Error = "Association DLMS echouee";
+                    outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.EchecLecture;
+                    _healthTracker.RecordResult(serial, TimeSpan.Zero, false);
+                    return outcome;
+                }
+
+                // 4. Read data + profiles
+                session.ReadObjects.Clear();
+                session.ReadObjects.AddRange(ParseObjects("0.0.42.0.0.255:2;0.0.96.2.128.255:2;1.0.99.1.0.255:4;1.0.99.2.0.255:4;0.0.0.2.8.255:2;0.0.0.2.0.255:2;1.0.0.2.2.255:2"));
+
+                var readSw = System.Diagnostics.Stopwatch.StartNew();
+                var readResult = await ReadCompteurDataAsync(session, meter, combinedCts.Token);
+                readSw.Stop();
+                outcome.ReadMs = readSw.ElapsedMilliseconds;
+
+                if (!readResult.Success)
+                {
+                    outcome.Error = readResult.ErrorMessage;
+                    outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.EchecLecture;
+                    _healthTracker.RecordResult(serial, totalSw.Elapsed, false);
+                    _metricsService?.RecordMeterRead(outcome.Ip, serial, totalSw.Elapsed, false);
+                    return outcome;
+                }
+
+                // 5. Process data
+                var dataProcessingService = _dataProcessingServiceFactory.Create();
+                await dataProcessingService.ProcessCompteurDataAsync(readResult.Data, meter.CompteurId);
+
+                // 6. Read profiles
+                var now = DateTime.Now;
+                session.ReadObjects.Clear();
+                session.ReadObjects.AddRange(ParseObjects(
+                    "1.0.99.1.0.255:2;1.0.99.2.0.255:2;1.0.99.3.0.255:2;0.0.98.1.0.255:2;0.0.99.98.0.255:2;0.0.99.98.1.255:2;0.0.99.98.2.255:2;0.0.99.98.3.255:2;0.0.99.98.4.255:2;0.0.99.98.5.255:2;0.0.99.98.6.255:2;0.0.99.98.7.255:2"));
+
+                var profileResult = await ReadProfileDataAsync(session, now.Date,
+                    new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0), combinedCts.Token);
+
+                if (profileResult.Success)
+                {
+                    await _hardwareService.ProcessAndSaveProfileDataAsync(profileResult.Data, serial);
+                }
+
+                // Success
+                outcome.Success = true;
+                outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.Lu;
+                totalSw.Stop();
+                outcome.TotalMs = totalSw.ElapsedMilliseconds;
+
+                _healthTracker.RecordResult(serial, totalSw.Elapsed, true);
+                _metricsService?.RecordMeterRead(outcome.Ip, serial, totalSw.Elapsed, true);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                totalSw.Stop();
+                outcome.TotalMs = totalSw.ElapsedMilliseconds;
+                outcome.Error = $"Timeout ({timeout.TotalSeconds}s)";
+                outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.EchecLecture;
+                _healthTracker.RecordResult(serial, totalSw.Elapsed, false);
+                _metricsService?.RecordMeterRead(outcome.Ip, serial, totalSw.Elapsed, false);
+            }
+            catch (Exception ex)
+            {
+                totalSw.Stop();
+                outcome.TotalMs = totalSw.ElapsedMilliseconds;
+                outcome.Error = ex.Message;
+                outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.EchecLecture;
+                _healthTracker.RecordResult(serial, totalSw.Elapsed, false);
+            }
+            finally
+            {
+                try { session.Reader?.Disconnect(); } catch { }
+            }
+
+            return outcome;
         }
 
         private async Task ReadMeterWithExistingSessionAsync(

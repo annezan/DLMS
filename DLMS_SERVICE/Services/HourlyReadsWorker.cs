@@ -1,9 +1,11 @@
 using DLMS_MODELS;
 using DLMS_MODELS.CompteurEquipementDomain.Entities;
+using DLMS_SERVICE.Services.MultiPass;
 using DLMS_UTILITIES;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace DLMS_SERVICE.Services
 {
@@ -11,8 +13,9 @@ namespace DLMS_SERVICE.Services
     {
         private readonly ILogger<HourlyReadsWorker> _logger;
         private readonly IServiceProvider _serviceProvider;
-        private readonly TimeSpan _checkInterval = TimeSpan.FromMinutes(1); // Vérification toutes les minutes
+        private readonly TimeSpan _checkInterval = TimeSpan.FromMinutes(1);
         private readonly IIPWorkerService _workerService;
+        private volatile bool _sessionInProgress;
 
         public HourlyReadsWorker(
             ILogger<HourlyReadsWorker> logger,
@@ -26,20 +29,17 @@ namespace DLMS_SERVICE.Services
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("=== Démarrage du HourlyReadsWorker ===");
-            _logger.LogInformation("Mode: Planification des lectures horaires automatiques");
+            _logger.LogInformation("=== Demarrage du HourlyReadsWorker (Multi-Pass) ===");
 
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
                     var now = DateTime.Now;
-                    _logger.LogDebug("Cycle de planification horaire à {Time}", now);
 
-                    // Exécuter seulement à chaque heure pile (minute 0)
                     if (now.Minute == 31)
                     {
-                        await EnqueueHourlyReadsAsync(now);
+                        await RunMultiPassSessionAsync(stoppingToken);
                     }
                 }
                 catch (Exception ex)
@@ -53,54 +53,73 @@ namespace DLMS_SERVICE.Services
                 }
                 catch (OperationCanceledException)
                 {
-                    _logger.LogInformation("Arrêt du HourlyReadsWorker demandé");
+                    _logger.LogInformation("Arret du HourlyReadsWorker demande");
                     break;
                 }
             }
 
-            _logger.LogInformation("=== Arrêt du HourlyReadsWorker ===");
+            _logger.LogInformation("=== Arret du HourlyReadsWorker ===");
         }
 
-        private async Task EnqueueHourlyReadsAsync(DateTime now)
+        private async Task RunMultiPassSessionAsync(CancellationToken ct)
         {
+            // Guard anti-overlap
+            if (_sessionInProgress)
+            {
+                _logger.LogWarning("Session multi-pass deja en cours — skip");
+                return;
+            }
+
+            _sessionInProgress = true;
             try
             {
                 using var scope = _serviceProvider.CreateScope();
-                var compteurEquipementUtilities = scope.ServiceProvider.GetRequiredService<CompteurEquipementUtilities>();
-                
-                var compteurs = await compteurEquipementUtilities.GetCompteurEquipement();
-                
-                if (compteurs == null || compteurs.Count == 0)
+
+                var cycleManager = scope.ServiceProvider.GetRequiredService<IReadingCycleManager>();
+                var orchestrator = scope.ServiceProvider.GetRequiredService<IReadSessionOrchestrator>();
+                var reportService = scope.ServiceProvider.GetRequiredService<ISessionReportService>();
+                var config = scope.ServiceProvider.GetRequiredService<IOptions<MultiPassConfig>>().Value;
+
+                // 1. Get or create cycle + unread meters
+                var (cycle, metersToRead) = await cycleManager.GetOrCreateCycleAsync();
+
+                if (cycle == null || metersToRead.Count == 0)
                 {
-                    _logger.LogWarning("Aucun compteur trouvé pour les lectures horaires");
+                    _logger.LogWarning("Aucun compteur a lire pour cette session");
                     return;
                 }
 
-                // Grouper les compteurs par IP pour optimiser les traitements
-                var compteursByIp = compteurs
-                    .Where(c => c.Equipement?.AdresseIp != null)
-                    .GroupBy(c => new { 
-                        IP = c.Equipement.AdresseIp, 
-                        Port = int.TryParse(c.Equipement.Port, out var port) ? port : 0 
-                    })
-                    .ToList();
+                _logger.LogInformation(
+                    "Lancement session multi-pass: cycle #{CycleId}, {Count} compteurs, session {SessionNum}",
+                    cycle.Id, metersToRead.Count, cycle.SessionActuelle + 1);
 
-                _logger.LogInformation("📝 Enqueue des lectures horaires pour {Count} groupes IP ({TotalCount} compteurs)", 
-                    compteursByIp.Count, compteurs.Count);
+                // 2. Run orchestrator
+                var report = await orchestrator.RunSessionAsync(
+                    metersToRead, config,
+                    cycle.SessionActuelle + 1,
+                    cycle.Id, ct);
 
-                // Envoyer chaque groupe d'IP dans la queue prioritaire avec le cycle start time
-                var cycleStartTime = DateTime.Now;
-                var tasks = compteursByIp
-                    .Select(group => _workerService.EnqueueHourlyReadsAsync(group.ToList(), now, cycleStartTime))
-                    .ToList();
+                // 3. Persist results
+                await cycleManager.PersistSessionResultsAsync(cycle, report, config);
 
-                await Task.WhenAll(tasks);
-                
-                _logger.LogInformation("✅ {Count} groupes de lectures horaires en queue avec priorité", compteursByIp.Count);
+                // 4. Log technical report
+                reportService.LogSessionReport(report);
+
+                _logger.LogInformation(
+                    "Session multi-pass terminee: {OK}/{Total} lus ({Rate:F1}%)",
+                    report.TotalSucceeded, report.TotalMetersInScope, report.TauxReussite);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("Session multi-pass annulee (arret demande)");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Erreur lors de l'enqueue des lectures horaires");
+                _logger.LogError(ex, "Erreur lors de la session multi-pass");
+            }
+            finally
+            {
+                _sessionInProgress = false;
             }
         }
     }

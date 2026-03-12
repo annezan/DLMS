@@ -14,6 +14,8 @@ using DLMS_MODELS.EventsDomain.Entities;
 using DLMS_MODELS.FabricantDomain.Entities;
 using DLMS_MODELS.GxdlmsprofilgenericDomain.Entities;
 using DLMS_MODELS.PosteDomain.Entities;
+using DLMS_MODELS.ReadingDomain.Entities;
+using DLMS_MODELS.ReadingDomain.Enums;
 using DLMS_MODELS.TypecommandeDomain.Entities;
 using DLMS_MODELS.UsersDomain.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -69,6 +71,15 @@ public partial class DLMSDBContext : DbContext
     public virtual DbSet<Permission> Permissions { get; set; }
     public virtual DbSet<RolePermission> RolePermissions { get; set; }
     public virtual DbSet<TokenUser> TokenUsers { get; set; }
+    #endregion
+
+    #region Multi-Pass Reading
+    public virtual DbSet<ReadingCycle> ReadingCycles { get; set; }
+    public virtual DbSet<ReadingSession> ReadingSessions { get; set; }
+    public virtual DbSet<SessionPassResult> SessionPassResults { get; set; }
+    public virtual DbSet<MeterReadingStatus> MeterReadingStatuses { get; set; }
+    public virtual DbSet<IpSessionStats> IpSessionStats { get; set; }
+    public virtual DbSet<ReadingConfiguration> ReadingConfigurations { get; set; }
     #endregion
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -184,6 +195,77 @@ public partial class DLMSDBContext : DbContext
                     .WithMany(p => p.Gxdlmsprofilgenericdetailsevents)
                     .HasForeignKey(pt => pt.EventId);
         });
+
+        #region Configuration Multi-Pass Reading
+
+        modelBuilder.Entity<ReadingCycle>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.ToTable("ReadingCycle");
+        });
+
+        modelBuilder.Entity<ReadingSession>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.ToTable("ReadingSession");
+
+            entity.HasOne(e => e.ReadingCycle)
+                  .WithMany(c => c.Sessions)
+                  .HasForeignKey(e => e.ReadingCycleId)
+                  .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<SessionPassResult>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.ToTable("SessionPassResult");
+
+            entity.HasOne(e => e.ReadingSession)
+                  .WithMany(s => s.Passes)
+                  .HasForeignKey(e => e.ReadingSessionId)
+                  .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<MeterReadingStatus>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.ToTable("MeterReadingStatus");
+
+            entity.HasOne(e => e.ReadingSession)
+                  .WithMany(s => s.MeterReadings)
+                  .HasForeignKey(e => e.ReadingSessionId)
+                  .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasOne(e => e.CompteurEquipement)
+                  .WithMany()
+                  .HasForeignKey(e => e.CompteurEquipementId)
+                  .OnDelete(DeleteBehavior.Restrict);
+
+            entity.HasIndex(e => new { e.ReadingSessionId, e.Resultat });
+            entity.HasIndex(e => new { e.ReadingSessionId, e.CompteurEquipementId });
+            entity.HasIndex(e => e.CompteurEquipementId);
+            entity.HasIndex(e => e.AdresseIp);
+        });
+
+        modelBuilder.Entity<IpSessionStats>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.ToTable("IpSessionStats");
+
+            entity.HasOne(e => e.ReadingSession)
+                  .WithMany(s => s.IpStats)
+                  .HasForeignKey(e => e.ReadingSessionId)
+                  .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<ReadingConfiguration>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.ToTable("ReadingConfiguration");
+            entity.HasIndex(e => e.Cle).IsUnique();
+        });
+
+        #endregion
 
         #region Configuration des relations Users - Roles - Permissions
         

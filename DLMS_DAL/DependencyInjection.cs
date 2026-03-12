@@ -43,6 +43,8 @@ using DLMS_DAL.UsersDomainDal.Repositories.Queries;
 using Microsoft.Extensions.DependencyInjection;
 using DLMS_DAL.CompteurEquipementDomainDal.Repositories.Queries;
 using DLMS_DAL.GxDLMSDomainDal.Repositories.Queries;
+using DLMS_DAL.ReadingDomainDal.Repositories.Commands;
+using DLMS_DAL.ReadingDomainDal.Repositories.Queries;
 using DLMS_DAL.Services;
 
 namespace DLMS.Infrastructure
@@ -102,6 +104,11 @@ namespace DLMS.Infrastructure
             services.AddTransient<ICompteurEquipementQueryRepository, CompteurEquipementQueryRepository>();
             services.AddTransient<ICompteurCelluleCommandRepository, CompteurCelluleCommandRepository>();
             services.AddTransient<ICompteurCelluleQueryRepository, CompteurCelluleQueryRepository>();
+
+            // Reading Domain (Multi-Pass)
+            services.AddTransient<IReadingCycleQueryRepository, ReadingCycleQueryRepository>();
+            services.AddTransient<IMeterReadingStatusQueryRepository, MeterReadingStatusQueryRepository>();
+            services.AddTransient<IReadingSessionCommandRepository, ReadingSessionCommandRepository>();
 
             services.AddTransient<IReadQueryRepository, ReadQueryRepository>();
             services.AddTransient<IReadObjectProfileQueryRepository, ReadObjectProfileQueryRepository>();

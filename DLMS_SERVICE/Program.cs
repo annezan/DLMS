@@ -23,6 +23,7 @@ using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.Json;
 using Microsoft.Extensions.Logging;
 using DLMS_SERVICE.Services;
+using DLMS_SERVICE.Services.MultiPass;
 using Microsoft.Extensions.Caching.Memory;
 
 namespace DLMS_SERVICE
@@ -33,6 +34,9 @@ namespace DLMS_SERVICE
 
         public static void Main(string[] args)
         {
+            // Prevent thread pool starvation from synchronous Gurux HDLC calls
+            ThreadPool.SetMinThreads(50, 50);
+
             ConfigureSerilog();
 
             try
@@ -132,6 +136,13 @@ namespace DLMS_SERVICE
                 services.AddTransient<IDLMSMissingReadService, DLMSMissingReadService>();
                 services.AddTransient<IDLMSCommandProcessorService, DLMSCommandProcessorService>();
                 
+                // === MULTI-PASS ORCHESTRATION ===
+                services.Configure<MultiPassConfig>(configuration.GetSection("MultiPass"));
+                services.AddSingleton<ITcpScanService, TcpScanService>();
+                services.AddTransient<IReadSessionOrchestrator, ReadSessionOrchestrator>();
+                services.AddTransient<ISessionReportService, SessionReportService>();
+                services.AddTransient<IReadingCycleManager, ReadingCycleManager>();
+
                 // DataProcessingService en dernier pour éviter les dépendances circulaires
                 services.AddScoped<IDataProcessingService, DataProcessingService>();
                 
@@ -239,9 +250,22 @@ namespace DLMS_SERVICE
                         outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] [{SourceContext}] {Message:lj}{NewLine}{Exception}",
                         shared: true,
                         restrictedToMinimumLevel: LogEventLevel.Information))
+                // Logs dédiés pour ReadSessionOrchestrator (multi-pass)
+                .WriteTo.Logger(lc => lc
+                    .Filter.ByIncludingOnly(e => e.Properties.ContainsKey("SourceContext") &&
+                        (e.Properties["SourceContext"].ToString().Contains("ReadSessionOrchestrator") ||
+                         e.Properties["SourceContext"].ToString().Contains("ReadingCycleManager") ||
+                         e.Properties["SourceContext"].ToString().Contains("SessionReportService")))
+                    .WriteTo.File(
+                        path: Path.Combine(logPath, "multi-pass-.log"),
+                        rollingInterval: RollingInterval.Day,
+                        retainedFileCountLimit: 30,
+                        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] [{SourceContext}] {Message:lj}{NewLine}{Exception}",
+                        shared: true,
+                        restrictedToMinimumLevel: LogEventLevel.Information))
                 // Logs dédiés pour IPWorkerService
                 .WriteTo.Logger(lc => lc
-                    .Filter.ByIncludingOnly(e => e.Properties.ContainsKey("SourceContext") && 
+                    .Filter.ByIncludingOnly(e => e.Properties.ContainsKey("SourceContext") &&
                         e.Properties["SourceContext"].ToString().Contains("IPWorkerService"))
                     .WriteTo.File(
                         path: Path.Combine(logPath, "ip-worker-.log"),

@@ -1096,6 +1096,367 @@ class Program
         return report;
     }
 
+    // ===== Multi-pass: single pass execution =====
+
+    private static async Task<PassResult> RunSinglePass(
+        List<MeterInfo> metersToRead,
+        PassConfig passConfig,
+        int effectiveBudget,
+        DLMSGuruxSessionFactory sessionFactory,
+        DLMSKeyService keyService,
+        int maxConcurrentIps,
+        ConcentratorStats concentratorStats,
+        HashSet<string>? previousDeferredIps)
+    {
+        var passResult = new PassResult { PassNumber = passConfig.PassNumber };
+        var budget = new PassBudget(effectiveBudget);
+        var adaptivePool = new AdaptivePool(maxConcurrentIps, minSize: 5, maxSize: 20);
+
+        Console.WriteLine($"=== PASS {passConfig.PassNumber}/3 ({effectiveBudget}s budget, {metersToRead.Count} compteurs) ===");
+        Console.WriteLine();
+
+        // --- Step 1: TCP scan ---
+        var ipGroups = metersToRead.GroupBy(m => $"{m.Ip}:{m.Port}").ToList();
+        var reachableIps = new HashSet<string>();
+
+        if (passConfig.PassNumber == 1 || previousDeferredIps == null)
+        {
+            // Pass 1: scan all IPs
+            Console.WriteLine($"[Pre-scan] Test TCP parallele de {ipGroups.Count} IPs (timeout {PassConfig.TcpScanTimeoutSeconds}s)...");
+            var allIps = ipGroups.Select(g => (g.First().Ip, g.First().Port)).Distinct().ToList();
+            var scanResults = await ParallelTcpScan(allIps, TimeSpan.FromSeconds(PassConfig.TcpScanTimeoutSeconds));
+
+            reachableIps = new HashSet<string>(scanResults.Where(r => r.Reachable).Select(r => r.Key));
+
+            // Individual retry fallback for failures
+            var failedScan = scanResults.Where(r => !r.Reachable).ToList();
+            if (failedScan.Count > 0 && failedScan.Count <= 10)
+            {
+                Console.WriteLine($"  [Pre-scan] Retry individuel de {failedScan.Count} IPs echouees...");
+                foreach (var f in failedScan)
+                {
+                    var parts = f.Key.Split(':');
+                    var retry = await SingleTcpScan(parts[0], parts[1], TimeSpan.FromSeconds(PassConfig.TcpScanTimeoutSeconds));
+                    if (retry.Reachable) reachableIps.Add(retry.Key);
+                }
+            }
+        }
+        else
+        {
+            // Pass 2/3: only re-scan deferred IPs
+            var ipsNeedingScan = ipGroups
+                .Where(g => previousDeferredIps.Contains($"{g.First().Ip}:{g.First().Port}"))
+                .Select(g => (g.First().Ip, g.First().Port)).Distinct().ToList();
+
+            if (ipsNeedingScan.Count > 0)
+            {
+                Console.WriteLine($"[Re-scan] Test TCP de {ipsNeedingScan.Count} IPs differees (timeout {PassConfig.TcpScanTimeoutSeconds}s)...");
+                var scanResults = await ParallelTcpScan(ipsNeedingScan, TimeSpan.FromSeconds(PassConfig.TcpScanTimeoutSeconds));
+                var newlyReachable = scanResults.Where(r => r.Reachable).Select(r => r.Key);
+                reachableIps.UnionWith(newlyReachable);
+            }
+
+            // IPs with retry meters that were reachable before: no re-scan needed
+            var previouslyReachableIps = ipGroups
+                .Select(g => $"{g.First().Ip}:{g.First().Port}")
+                .Where(ip => !previousDeferredIps.Contains(ip));
+            reachableIps.UnionWith(previouslyReachableIps);
+        }
+
+        // Defer unreachable IPs
+        foreach (var g in ipGroups.Where(g => !reachableIps.Contains($"{g.First().Ip}:{g.First().Port}")))
+        {
+            var ipKey = $"{g.First().Ip}:{g.First().Port}";
+            passResult.DeferIp(ipKey);
+            foreach (var m in g) passResult.DeferMeter(m);
+        }
+
+        Console.WriteLine($"  Resultats: {reachableIps.Count}/{ipGroups.Count} IPs accessibles");
+        Console.WriteLine();
+
+        // --- Step 2: Sort reachable IPs ---
+        var reachableGroups = ipGroups
+            .Where(g => reachableIps.Contains($"{g.First().Ip}:{g.First().Port}"))
+            .Select(g => (Key: $"{g.First().Ip}:{g.First().Port}",
+                          Meters: g.OrderByDescending(m => HasCache(m) ? 1 : 0).ToList()))
+            .OrderBy(g => g.Meters.Count <= 5 ? 0 : 1)
+            .ThenByDescending(g => g.Meters.Count(m => HasCache(m)))
+            .ThenBy(g => g.Meters.Count)
+            .ToList();
+
+        var totalReachableMeters = reachableGroups.Sum(g => g.Meters.Count);
+        Console.WriteLine($"  Pool: {maxConcurrentIps} IPs max en parallele");
+        Console.WriteLine($"  Lancement de {totalReachableMeters} lectures sur {reachableGroups.Count} IPs...");
+        Console.WriteLine();
+
+        // --- Step 3: Process each IP in parallel (pool-limited) ---
+        var consoleLock = new object();
+        int completedIps = 0;
+
+        var tasks = reachableGroups.Select(entry => Task.Run(async () =>
+        {
+            await adaptivePool.WaitAsync();
+            try
+            {
+                if (budget.IsExpired)
+                {
+                    lock (consoleLock) { Console.WriteLine($"    [{entry.Key}] Budget expire, {entry.Meters.Count} compteurs differes"); }
+                    // Record budget-expired meters with error (for categorization) if last pass
+                    if (passConfig.PassNumber >= 3)
+                    {
+                        foreach (var m in entry.Meters)
+                        {
+                            lock (passResult.Results)
+                            {
+                                passResult.Results.Add(new MeterResult
+                                {
+                                    Serial = m.Serial, Ip = m.Ip, Port = m.Port,
+                                    Error = "Budget expired"
+                                });
+                            }
+                        }
+                    }
+                    else
+                    {
+                        foreach (var m in entry.Meters) passResult.DeferMeter(m);
+                        passResult.DeferIp(entry.Key);
+                    }
+                    return;
+                }
+
+                var meterList = entry.Meters;
+                var firstMeter = meterList[0];
+                var ipKey = entry.Key;
+
+                // Open TCP
+                var transportParams = new DLMSConnectionParameters
+                {
+                    AddressIp = firstMeter.Ip,
+                    Port = firstMeter.Port,
+                    Trace = TraceLevel.Off
+                };
+                var session = sessionFactory.CreateSession(transportParams);
+
+                using var tcpCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                var tcpOk = await session.OpenTransportAsync(tcpCts.Token);
+                if (!tcpOk)
+                {
+                    lock (consoleLock) { Console.WriteLine($"    [{ipKey}] TCP echec, {meterList.Count} compteurs differes"); }
+                    passResult.DeferIp(ipKey);
+                    foreach (var m in meterList) passResult.DeferMeter(m);
+                    return;
+                }
+
+                try
+                {
+                    // --- Canary test ---
+                    var canaryMeter = meterList[0];
+                    var canaryTimeout = budget.ClampTimeout(passConfig.CanaryTimeoutSeconds);
+                    if (canaryTimeout == -1)
+                    {
+                        foreach (var m in meterList) passResult.DeferMeter(m);
+                        passResult.DeferIp(ipKey);
+                        return;
+                    }
+
+                    Console.WriteLine($"    [{ipKey}] Canary {canaryMeter.Serial} (timeout:{canaryTimeout}s)");
+
+                    MeterResult canaryResult;
+                    var canarySw = Stopwatch.StartNew();
+                    try
+                    {
+                        canaryResult = await ReadSingleMeter(session, canaryMeter, keyService)
+                            .WaitAsync(TimeSpan.FromSeconds(canaryTimeout));
+                    }
+                    catch (TimeoutException)
+                    {
+                        canaryResult = new MeterResult
+                        {
+                            Serial = canaryMeter.Serial, Ip = canaryMeter.Ip, Port = canaryMeter.Port,
+                            Error = $"Canary timeout ({canaryTimeout}s)"
+                        };
+                        try { session.Reader?.Disconnect(); } catch { }
+                    }
+                    canarySw.Stop();
+
+                    // Record canary result
+                    lock (passResult.Results) { passResult.Results.Add(canaryResult); }
+                    concentratorStats.Record(ipKey, canaryResult.Success,
+                        canaryResult.HdlcMs + canaryResult.ReadMs + canaryResult.KeysRetrievalMs);
+
+                    if (!canaryResult.Success)
+                    {
+                        try { session.Reader?.Disconnect(); } catch { }
+                        if (passConfig.PassNumber < 3)
+                        {
+                            // Pass 1/2: defer remaining meters to next pass
+                            lock (consoleLock) { Console.WriteLine($"    [{ipKey}] Canary ECHEC — {meterList.Count - 1} compteurs differes"); }
+                            for (int i = 1; i < meterList.Count; i++)
+                                passResult.DeferMeter(meterList[i]);
+                            passResult.DeferIp(ipKey);
+                        }
+                        else
+                        {
+                            // Pass 3: no next pass — record remaining as definitively failed
+                            lock (consoleLock) { Console.WriteLine($"    [{ipKey}] Canary ECHEC Pass 3 — {meterList.Count - 1} compteurs en abandon definitif"); }
+                            for (int i = 1; i < meterList.Count; i++)
+                            {
+                                lock (passResult.Results)
+                                {
+                                    passResult.Results.Add(new MeterResult
+                                    {
+                                        Serial = meterList[i].Serial, Ip = meterList[i].Ip, Port = meterList[i].Port,
+                                        Error = "Abandon definitif (canary echec Pass 3)"
+                                    });
+                                }
+                            }
+                        }
+                        return;
+                    }
+
+                    var canaryLatencyMs = canarySw.ElapsedMilliseconds;
+                    lock (consoleLock)
+                    {
+                        Console.WriteLine($"    [{ipKey}] Canary OK ({canaryLatencyMs}ms) — lecture de {meterList.Count - 1} compteurs restants");
+                    }
+
+                    // --- Read remaining meters (skip index 0 = canary) ---
+                    int consecutiveFailures = 0;
+                    int cooldownsUsed = 0;
+
+                    for (int i = 1; i < meterList.Count; i++)
+                    {
+                        var meter = meterList[i];
+
+                        // Budget check
+                        if (budget.IsExpired)
+                        {
+                            for (int j = i; j < meterList.Count; j++)
+                                passResult.DeferMeter(meterList[j]);
+                            break;
+                        }
+
+                        var hasCacheFile = HasCache(meter);
+                        var adaptiveTimeout = ComputeAdaptiveTimeout(canaryLatencyMs, hasCacheFile, passConfig);
+                        var clampedTimeout = budget.ClampTimeout(adaptiveTimeout);
+                        if (clampedTimeout == -1)
+                        {
+                            for (int j = i; j < meterList.Count; j++)
+                                passResult.DeferMeter(meterList[j]);
+                            break;
+                        }
+
+                        Console.WriteLine($"    [{ipKey}] Debut lecture {meter.Serial} (timeout:{clampedTimeout}s)");
+
+                        MeterResult meterResult;
+                        try
+                        {
+                            meterResult = await ReadSingleMeter(session, meter, keyService)
+                                .WaitAsync(TimeSpan.FromSeconds(clampedTimeout));
+                        }
+                        catch (TimeoutException)
+                        {
+                            meterResult = new MeterResult
+                            {
+                                Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
+                                Error = $"Timeout ({clampedTimeout}s)"
+                            };
+                            try { session.Reader?.Disconnect(); } catch { }
+                        }
+
+                        lock (passResult.Results) { passResult.Results.Add(meterResult); }
+                        concentratorStats.Record(ipKey, meterResult.Success,
+                            meterResult.HdlcMs + meterResult.ReadMs + meterResult.KeysRetrievalMs);
+
+                        if (meterResult.Success)
+                        {
+                            Console.WriteLine($"    [{ipKey}] {meter.Serial} OK (HDLC:{meterResult.HdlcMs}ms, Lecture:{meterResult.ReadMs}ms)");
+                            consecutiveFailures = 0;
+                        }
+                        else
+                        {
+                            Console.WriteLine($"    [{ipKey}] {meter.Serial} ECHEC - {meterResult.Error}");
+                            consecutiveFailures++;
+                            if (consecutiveFailures >= passConfig.MaxConsecutiveFailures)
+                            {
+                                if (cooldownsUsed < passConfig.CooldownCount)
+                                {
+                                    Console.WriteLine($"    [{ipKey}] Cooldown {passConfig.CooldownSeconds}s apres {passConfig.MaxConsecutiveFailures} echecs consecutifs");
+                                    await Task.Delay(TimeSpan.FromSeconds(passConfig.CooldownSeconds));
+                                    consecutiveFailures = 0;
+                                    cooldownsUsed++;
+                                }
+                                else if (passConfig.PassNumber < 3)
+                                {
+                                    Console.WriteLine($"    [{ipKey}] IP differee apres {passConfig.MaxConsecutiveFailures} echecs consecutifs");
+                                    for (int j = i + 1; j < meterList.Count; j++)
+                                        passResult.DeferMeter(meterList[j]);
+                                    passResult.DeferIp(ipKey);
+                                    break;
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"    [{ipKey}] ABANDON DEFINITIF apres {passConfig.MaxConsecutiveFailures} echecs consecutifs");
+                                    for (int j = i + 1; j < meterList.Count; j++)
+                                    {
+                                        lock (passResult.Results)
+                                        {
+                                            passResult.Results.Add(new MeterResult
+                                            {
+                                                Serial = meterList[j].Serial,
+                                                Ip = meterList[j].Ip,
+                                                Port = meterList[j].Port,
+                                                Error = "Abandon definitif"
+                                            });
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    await session.DisconnectAsync();
+                }
+
+                // Log summary for this IP
+                var ok = passResult.Results.Count(r => r.Success && r.Ip == firstMeter.Ip);
+                var ipNum = Interlocked.Increment(ref completedIps);
+                lock (consoleLock)
+                {
+                    Console.WriteLine($"  [IP {ipNum}/{reachableGroups.Count}] {ipKey} : {ok}/{meterList.Count} OK");
+                }
+
+                // Adaptive pool adjustment every 5 completed IPs
+                if (ipNum % 5 == 0)
+                {
+                    var (successRate, avgLatencyMs, total) = concentratorStats.GetGlobalStats();
+                    if (successRate > 80 && avgLatencyMs < 60000)
+                    {
+                        adaptivePool.Expand(2);
+                        lock (consoleLock) { Console.WriteLine($"  [POOL] Expanded to {adaptivePool.CurrentSize} (success={successRate:F0}%, lat={avgLatencyMs:F0}ms)"); }
+                    }
+                    else if (successRate < 50 || avgLatencyMs > 120000)
+                    {
+                        adaptivePool.Shrink(2);
+                        lock (consoleLock) { Console.WriteLine($"  [POOL] Shrunk to {adaptivePool.CurrentSize} (success={successRate:F0}%, lat={avgLatencyMs:F0}ms)"); }
+                    }
+                }
+            }
+            finally
+            {
+                adaptivePool.Release();
+            }
+        })).ToList();
+
+        await Task.WhenAll(tasks);
+
+        passResult.ElapsedMs = budget.ElapsedMs;
+        return passResult;
+    }
+
     // ===== PrintReport =====
 
     private static void PrintReport(TestReport report)

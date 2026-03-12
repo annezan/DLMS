@@ -1391,6 +1391,70 @@ class Program
         return 0;
     }
 
+    // ===== Multi-pass helpers =====
+
+    private static bool HasCache(MeterInfo m) =>
+        File.Exists(Path.Combine("associations", $"{m.Serial}_Read.xml"));
+
+    private static int ComputeAdaptiveTimeout(long canaryLatencyMs, bool hasCacheFile, PassConfig config)
+    {
+        var raw = (int)(canaryLatencyMs / 1000.0 * 2.5);
+        var ceiling = hasCacheFile ? config.CachedTimeoutSeconds : config.UncachedTimeoutSeconds;
+        return Math.Clamp(raw, 45, ceiling);
+    }
+
+    private static async Task<List<(string Key, bool Reachable, long Ms)>> ParallelTcpScan(
+        IEnumerable<(string Ip, string Port)> targets, TimeSpan timeout)
+    {
+        var scanLock = new object();
+        int scanned = 0;
+        var targetList = targets.ToList();
+
+        var tasks = targetList.Select(t => Task.Run(async () =>
+        {
+            var key = $"{t.Ip}:{t.Port}";
+            try
+            {
+                using var client = new TcpClient();
+                using var cts = new CancellationTokenSource(timeout);
+                var sw = Stopwatch.StartNew();
+                await client.ConnectAsync(t.Ip, int.Parse(t.Port), cts.Token);
+                sw.Stop();
+                var num = Interlocked.Increment(ref scanned);
+                lock (scanLock) { Console.WriteLine($"  [{num}/{targetList.Count}] {key} : OK ({sw.ElapsedMilliseconds}ms)"); }
+                return (Key: key, Reachable: true, Ms: sw.ElapsedMilliseconds);
+            }
+            catch (Exception ex)
+            {
+                var num = Interlocked.Increment(ref scanned);
+                lock (scanLock) { Console.WriteLine($"  [{num}/{targetList.Count}] {key} : ECHEC ({ex.Message})"); }
+                return (Key: key, Reachable: false, Ms: (long)timeout.TotalMilliseconds);
+            }
+        }));
+        return (await Task.WhenAll(tasks)).ToList();
+    }
+
+    private static async Task<(string Key, bool Reachable, long Ms)> SingleTcpScan(
+        string ip, string port, TimeSpan timeout)
+    {
+        var key = $"{ip}:{port}";
+        try
+        {
+            using var client = new TcpClient();
+            using var cts = new CancellationTokenSource(timeout);
+            var sw = Stopwatch.StartNew();
+            await client.ConnectAsync(ip, int.Parse(port), cts.Token);
+            sw.Stop();
+            Console.WriteLine($"  [retry] {key} : OK ({sw.ElapsedMilliseconds}ms)");
+            return (key, true, sw.ElapsedMilliseconds);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  [retry] {key} : ECHEC ({ex.Message})");
+            return (key, false, (long)timeout.TotalMilliseconds);
+        }
+    }
+
     // ===== GetConnectionString (unchanged) =====
 
     private static string GetConnectionString(IConfiguration configuration)

@@ -1007,57 +1007,77 @@ class Program
 
                 try
                 {
-                    // --- Canary test ---
-                    var canaryMeter = meterList[0];
-                    var canaryTimeout = budget.ClampTimeout(passConfig.CanaryTimeoutSeconds);
-                    if (canaryTimeout == -1)
-                    {
-                        foreach (var m in meterList) passResult.DeferMeter(m);
-                        passResult.DeferIp(ipKey);
-                        return;
-                    }
+                    // --- Canary test (rotating: try up to 3 different meters) ---
+                    var maxCanaryAttempts = Math.Min(3, meterList.Count);
+                    MeterResult? canaryResult = null;
+                    int canaryIndex = -1;
+                    long canaryLatencyMs = 0;
 
-                    Console.WriteLine($"    [{ipKey}] Canary {canaryMeter.Serial} (timeout:{canaryTimeout}s)");
-
-                    MeterResult canaryResult;
-                    var canarySw = Stopwatch.StartNew();
-                    try
+                    for (int c = 0; c < maxCanaryAttempts; c++)
                     {
-                        canaryResult = await ReadSingleMeter(session, canaryMeter, keyService)
-                            .WaitAsync(TimeSpan.FromSeconds(canaryTimeout));
-                    }
-                    catch (TimeoutException)
-                    {
-                        canaryResult = new MeterResult
+                        var canaryMeter = meterList[c];
+                        var canaryTimeout = budget.ClampTimeout(passConfig.CanaryTimeoutSeconds);
+                        if (canaryTimeout == -1)
                         {
-                            Serial = canaryMeter.Serial, Ip = canaryMeter.Ip, Port = canaryMeter.Port,
-                            Error = $"Canary timeout ({canaryTimeout}s)"
-                        };
-                        try { session.Reader?.Disconnect(); } catch { }
+                            foreach (var m in meterList) passResult.DeferMeter(m);
+                            passResult.DeferIp(ipKey);
+                            return;
+                        }
+
+                        lock (consoleLock) { Console.WriteLine($"    [{ipKey}] Canary {canaryMeter.Serial} (timeout:{canaryTimeout}s){(c > 0 ? $" [tentative {c + 1}/{maxCanaryAttempts}]" : "")}"); }
+
+                        MeterResult result;
+                        var canarySw = Stopwatch.StartNew();
+                        try
+                        {
+                            result = await ReadSingleMeter(session, canaryMeter, keyService)
+                                .WaitAsync(TimeSpan.FromSeconds(canaryTimeout));
+                        }
+                        catch (TimeoutException)
+                        {
+                            result = new MeterResult
+                            {
+                                Serial = canaryMeter.Serial, Ip = canaryMeter.Ip, Port = canaryMeter.Port,
+                                Error = $"Canary timeout ({canaryTimeout}s)"
+                            };
+                            try { session.Reader?.Disconnect(); } catch { }
+                        }
+                        canarySw.Stop();
+
+                        // Record this canary attempt
+                        lock (passResult.Results) { passResult.Results.Add(result); }
+                        concentratorStats.Record(ipKey, result.Success,
+                            result.HdlcMs + result.ReadMs + result.KeysRetrievalMs);
+
+                        if (result.Success)
+                        {
+                            canaryResult = result;
+                            canaryIndex = c;
+                            canaryLatencyMs = canarySw.ElapsedMilliseconds;
+                            break;
+                        }
+
+                        lock (consoleLock) { Console.WriteLine($"    [{ipKey}] Canary {canaryMeter.Serial} ECHEC - {result.Error}"); }
                     }
-                    canarySw.Stop();
 
-                    // Record canary result
-                    lock (passResult.Results) { passResult.Results.Add(canaryResult); }
-                    concentratorStats.Record(ipKey, canaryResult.Success,
-                        canaryResult.HdlcMs + canaryResult.ReadMs + canaryResult.KeysRetrievalMs);
-
-                    if (!canaryResult.Success)
+                    // All canary attempts failed
+                    if (canaryResult == null || !canaryResult.Success)
                     {
                         try { session.Reader?.Disconnect(); } catch { }
+                        var remainingStart = maxCanaryAttempts;
+                        var remainingCount = meterList.Count - remainingStart;
+
                         if (passConfig.PassNumber < 3)
                         {
-                            // Pass 1/2: defer remaining meters to next pass
-                            lock (consoleLock) { Console.WriteLine($"    [{ipKey}] Canary ECHEC — {meterList.Count - 1} compteurs differes"); }
-                            for (int i = 1; i < meterList.Count; i++)
+                            lock (consoleLock) { Console.WriteLine($"    [{ipKey}] Canary ECHEC ({maxCanaryAttempts} tentatives) — {remainingCount} compteurs differes"); }
+                            for (int i = remainingStart; i < meterList.Count; i++)
                                 passResult.DeferMeter(meterList[i]);
                             passResult.DeferIp(ipKey);
                         }
                         else
                         {
-                            // Pass 3: no next pass — record remaining as definitively failed
-                            lock (consoleLock) { Console.WriteLine($"    [{ipKey}] Canary ECHEC Pass 3 — {meterList.Count - 1} compteurs en abandon definitif"); }
-                            for (int i = 1; i < meterList.Count; i++)
+                            lock (consoleLock) { Console.WriteLine($"    [{ipKey}] Canary ECHEC Pass 3 ({maxCanaryAttempts} tentatives) — {remainingCount} compteurs en abandon definitif"); }
+                            for (int i = remainingStart; i < meterList.Count; i++)
                             {
                                 lock (passResult.Results)
                                 {
@@ -1072,17 +1092,19 @@ class Program
                         return;
                     }
 
-                    var canaryLatencyMs = canarySw.ElapsedMilliseconds;
+                    // Canary succeeded — skip meters already tried as canary (index 0..canaryIndex)
+                    var readStartIndex = canaryIndex + 1;
+                    var metersToReadCount = meterList.Count - readStartIndex;
                     lock (consoleLock)
                     {
-                        Console.WriteLine($"    [{ipKey}] Canary OK ({canaryLatencyMs}ms) — lecture de {meterList.Count - 1} compteurs restants");
+                        Console.WriteLine($"    [{ipKey}] Canary OK ({canaryLatencyMs}ms) — lecture de {metersToReadCount} compteurs restants");
                     }
 
-                    // --- Read remaining meters (skip index 0 = canary) ---
+                    // --- Read remaining meters (skip canary candidates 0..canaryIndex) ---
                     int consecutiveFailures = 0;
                     int cooldownsUsed = 0;
 
-                    for (int i = 1; i < meterList.Count; i++)
+                    for (int i = readStartIndex; i < meterList.Count; i++)
                     {
                         var meter = meterList[i];
 
@@ -1370,10 +1392,13 @@ class Program
             Console.WriteLine();
         }
 
-        // Per-IP concentrator stats
+        // Per-IP concentrator stats (deduplicated by serial — keep last result per meter)
         Console.WriteLine("=== STATISTIQUES PAR CONCENTRATEUR ===");
-        var allResults = report.AllResults;
-        var ipStats = allResults
+        var dedupResults = report.AllResults
+            .GroupBy(r => r.Serial)
+            .Select(g => g.Last())
+            .ToList();
+        var ipStats = dedupResults
             .GroupBy(r => $"{r.Ip}:{r.Port}")
             .Select(g => new
             {

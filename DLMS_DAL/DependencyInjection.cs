@@ -109,6 +109,8 @@ namespace DLMS.Infrastructure
             services.AddTransient<IReadingCycleQueryRepository, ReadingCycleQueryRepository>();
             services.AddTransient<IMeterReadingStatusQueryRepository, MeterReadingStatusQueryRepository>();
             services.AddTransient<IReadingSessionCommandRepository, ReadingSessionCommandRepository>();
+            services.AddTransient<IMeterProfileReadHistoryQueryRepository, MeterProfileReadHistoryQueryRepository>();
+            services.AddTransient<IMeterProfileReadHistoryCommandRepository, MeterProfileReadHistoryCommandRepository>();
 
             services.AddTransient<IReadQueryRepository, ReadQueryRepository>();
             services.AddTransient<IReadObjectProfileQueryRepository, ReadObjectProfileQueryRepository>();

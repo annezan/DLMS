@@ -12,6 +12,9 @@ using Newtonsoft.Json;
 using System.Collections.Concurrent;
 using System.IO.Ports;
 using DLMS_SERVICE.Services.MultiPass;
+using DLMS_DAL.ReadingDomainDal.Repositories.Queries;
+using DLMS_DAL.ReadingDomainDal.Repositories.Commands;
+using DLMS_MODELS.ReadingDomain.Entities;
 
 namespace DLMS_SERVICE.Services
 {
@@ -42,6 +45,7 @@ namespace DLMS_SERVICE.Services
         private readonly IServiceProvider _serviceProvider;
         private readonly IDLMSMetricsService _metricsService;
         private readonly IMeterHealthTracker _healthTracker;
+        private readonly IProfileReadingConfig _profileConfig;
         private readonly TimeSpan _readTimeout = TimeSpan.FromMinutes(3);
 
         public DLMSParallelReadService(
@@ -52,7 +56,8 @@ namespace DLMS_SERVICE.Services
             ILogger<DLMSParallelReadService> logger,
             IServiceProvider serviceProvider,
             IDLMSMetricsService metricsService,
-            IMeterHealthTracker healthTracker)
+            IMeterHealthTracker healthTracker,
+            IProfileReadingConfig profileConfig)
         {
             _sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
             _keyService = keyService ?? throw new ArgumentNullException(nameof(keyService));
@@ -62,6 +67,7 @@ namespace DLMS_SERVICE.Services
             _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
             _metricsService = metricsService ?? throw new ArgumentNullException(nameof(metricsService));
             _healthTracker = healthTracker ?? throw new ArgumentNullException(nameof(healthTracker));
+            _profileConfig = profileConfig ?? throw new ArgumentNullException(nameof(profileConfig));
         }
 
         public async Task ProcessUmadGroupAsync(
@@ -1055,6 +1061,185 @@ namespace DLMS_SERVICE.Services
                     ErrorMessage = ex.Message
                 };
             }
+        }
+
+        private async Task<ReadResult> ReadSingleProfileAsync(
+            IDLMSCommunicationSession session,
+            string profileObis,
+            DateTime dateStart,
+            DateTime dateEnd,
+            int timeoutSeconds,
+            CancellationToken ct)
+        {
+            try
+            {
+                session.ReadObjects.Clear();
+                session.ReadObjects.AddRange(ParseObjects($"{profileObis}:2"));
+
+                using var profileCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+                using var combined = CancellationTokenSource.CreateLinkedTokenSource(ct, profileCts.Token);
+
+                var reader = new DLMS_COMMUNICATION.Reader.NonStaticReaderCommunication();
+                var readTask = Task.Run(
+                    () => reader.ReadRowsByRangeAsync(session, dateStart.ToString(), dateEnd.ToString()),
+                    combined.Token);
+
+                var result = await readTask;
+
+                return new ReadResult
+                {
+                    Success = !string.IsNullOrEmpty(result) && result != "Lecture impossible",
+                    Data = result,
+                    ErrorMessage = result == "Lecture impossible" ? $"Echec lecture profil {profileObis}" : ""
+                };
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogWarning("Timeout ({Timeout}s) lecture profil {Obis}", timeoutSeconds, profileObis);
+                return new ReadResult { Success = false, Data = "", ErrorMessage = $"Timeout {timeoutSeconds}s" };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Erreur lecture profil {Obis}", profileObis);
+                return new ReadResult { Success = false, Data = "", ErrorMessage = ex.Message };
+            }
+        }
+
+        private async Task<List<ProfileReadResult>> ReadProfilesSequentialAsync(
+            IDLMSCommunicationSession session,
+            string serial,
+            CancellationToken ct)
+        {
+            var results = new List<ProfileReadResult>();
+            var profiles = await _profileConfig.GetOrderedProfilesAsync();
+            var now = DateTime.Now;
+
+            // Load all history for this meter in one query
+            List<MeterProfileReadHistory> histories;
+            using (var scope = _serviceProvider.CreateScope())
+            {
+                var queryRepo = scope.ServiceProvider.GetRequiredService<IMeterProfileReadHistoryQueryRepository>();
+                histories = await queryRepo.GetAllForMeterAsync(serial);
+            }
+
+            foreach (var profile in profiles)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                var profileResult = new ProfileReadResult { ProfileObis = profile.ProfileObis };
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+
+                try
+                {
+                    // Calculate incremental date range
+                    var history = histories.FirstOrDefault(h => h.ProfileObis == profile.ProfileObis);
+                    var fallbackLimit = now.AddHours(-profile.FallbackMaxHours);
+
+                    DateTime dateStart;
+                    if (history != null)
+                    {
+                        // Clock drift guard
+                        if (history.LastReadUpTo > now.AddMinutes(15))
+                        {
+                            _logger.LogWarning("Clock drift {Serial}/{Obis}: LastReadUpTo={Last} > now+15min, reset",
+                                serial, profile.ProfileObis, history.LastReadUpTo);
+                            dateStart = fallbackLimit;
+                        }
+                        else
+                        {
+                            dateStart = history.LastReadUpTo > fallbackLimit ? history.LastReadUpTo : fallbackLimit;
+                        }
+                    }
+                    else
+                    {
+                        dateStart = fallbackLimit;
+                    }
+
+                    // Round dateEnd based on profile interval
+                    DateTime dateEnd;
+                    if (profile.ProfileObis == "1.0.99.2.0.255") // 5-min profile
+                        dateEnd = new DateTime(now.Year, now.Month, now.Day, now.Hour, (now.Minute / 5) * 5, 0);
+                    else if (profile.ProfileObis == "1.0.99.1.0.255") // 1-hour profile
+                        dateEnd = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0);
+                    else if (profile.ProfileObis == "1.0.99.3.0.255") // 24-hour profile
+                        dateEnd = now.Date;
+                    else
+                        dateEnd = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0);
+
+                    // Skip if nothing new
+                    if (dateStart >= dateEnd)
+                    {
+                        _logger.LogDebug("Skip {Obis} pour {Serial}: rien de nouveau ({Start} >= {End})",
+                            profile.ProfileObis, serial, dateStart, dateEnd);
+                        profileResult.Success = true;
+                        profileResult.RowsRead = 0;
+                        sw.Stop();
+                        profileResult.DurationMs = sw.ElapsedMilliseconds;
+                        results.Add(profileResult);
+                        continue;
+                    }
+
+                    // Read this single profile
+                    var readResult = await ReadSingleProfileAsync(session, profile.ProfileObis, dateStart, dateEnd, profile.TimeoutSeconds, ct);
+
+                    if (readResult.Success)
+                    {
+                        // Save to DB
+                        var rowsInserted = await _hardwareService.ProcessAndSaveSingleProfileAsync(
+                            readResult.Data, serial, profile.ProfileObis);
+
+                        sw.Stop();
+                        profileResult.Success = true;
+                        profileResult.RowsRead = rowsInserted;
+                        profileResult.DurationMs = sw.ElapsedMilliseconds;
+
+                        // Update LastReadUpTo after successful persistence
+                        using var scope = _serviceProvider.CreateScope();
+                        var cmdRepo = scope.ServiceProvider.GetRequiredService<IMeterProfileReadHistoryCommandRepository>();
+                        await cmdRepo.UpsertAsync(serial, profile.ProfileObis, dateEnd, rowsInserted, sw.ElapsedMilliseconds);
+
+                        _logger.LogDebug("Profil {Obis} lu pour {Serial}: {Rows} lignes en {Ms}ms ({Start} -> {End})",
+                            profile.ProfileObis, serial, rowsInserted, sw.ElapsedMilliseconds, dateStart, dateEnd);
+                    }
+                    else
+                    {
+                        sw.Stop();
+                        profileResult.Error = readResult.ErrorMessage;
+                        profileResult.DurationMs = sw.ElapsedMilliseconds;
+
+                        _logger.LogWarning("Echec profil {Obis} pour {Serial}: {Error}",
+                            profile.ProfileObis, serial, readResult.ErrorMessage);
+
+                        // If timeout, try HDLC recovery
+                        if (readResult.ErrorMessage.Contains("Timeout"))
+                        {
+                            try
+                            {
+                                session.Reader?.Disconnect();
+                                session.Reader?.InitializeConnection();
+                                _logger.LogDebug("HDLC reconnecte apres timeout profil {Obis}", profile.ProfileObis);
+                            }
+                            catch (Exception reconnEx)
+                            {
+                                _logger.LogWarning(reconnEx, "HDLC reconnexion echouee apres timeout {Obis}, arret profils", profile.ProfileObis);
+                                results.Add(profileResult);
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    sw.Stop();
+                    profileResult.Error = ex.Message;
+                    profileResult.DurationMs = sw.ElapsedMilliseconds;
+                    _logger.LogError(ex, "Exception profil {Obis} pour {Serial}", profile.ProfileObis, serial);
+                }
+
+                results.Add(profileResult);
+            }
+
+            return results;
         }
 
         private async Task<ReadResult> ReadRowsByEntryAsync(IDLMSCommunicationSession session, int nombreEntree)

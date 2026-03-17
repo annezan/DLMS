@@ -142,6 +142,7 @@ namespace DLMS_SERVICE
                 services.AddTransient<IReadSessionOrchestrator, ReadSessionOrchestrator>();
                 services.AddTransient<ISessionReportService, SessionReportService>();
                 services.AddTransient<IReadingCycleManager, ReadingCycleManager>();
+                services.AddSingleton<IProfileReadingConfig, ProfileReadingConfig>();
 
                 // DataProcessingService en dernier pour éviter les dépendances circulaires
                 services.AddScoped<IDataProcessingService, DataProcessingService>();

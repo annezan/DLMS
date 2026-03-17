@@ -18,6 +18,16 @@ public class MeterReadOutcome
     public long TotalMs { get; set; }
     public int TimeoutApplied { get; set; }
     public MeterReadingResult ResultCategory { get; set; } = MeterReadingResult.NonTraite;
+    public List<ProfileReadResult> ProfileResults { get; set; } = new();
+}
+
+public class ProfileReadResult
+{
+    public string ProfileObis { get; set; } = "";
+    public bool Success { get; set; }
+    public int RowsRead { get; set; }
+    public long DurationMs { get; set; }
+    public string Error { get; set; } = "";
 }
 
 public class PassResult

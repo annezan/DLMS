@@ -80,6 +80,7 @@ public partial class DLMSDBContext : DbContext
     public virtual DbSet<MeterReadingStatus> MeterReadingStatuses { get; set; }
     public virtual DbSet<IpSessionStats> IpSessionStats { get; set; }
     public virtual DbSet<ReadingConfiguration> ReadingConfigurations { get; set; }
+    public virtual DbSet<MeterProfileReadHistory> MeterProfileReadHistories { get; set; }
     #endregion
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -263,6 +264,13 @@ public partial class DLMSDBContext : DbContext
             entity.HasKey(e => e.Id);
             entity.ToTable("ReadingConfiguration");
             entity.HasIndex(e => e.Cle).IsUnique();
+        });
+
+        modelBuilder.Entity<MeterProfileReadHistory>(entity =>
+        {
+            entity.ToTable("MeterProfileReadHistory");
+            entity.HasIndex(e => new { e.CompteurSerial, e.ProfileObis }).IsUnique();
+            entity.HasIndex(e => e.CompteurSerial);
         });
 
         #endregion

@@ -767,19 +767,9 @@ namespace DLMS_SERVICE.Services
                 var dataProcessingService = _dataProcessingServiceFactory.Create();
                 await dataProcessingService.ProcessCompteurDataAsync(readResult.Data, meter.CompteurId);
 
-                // 6. Read profiles
-                var now = DateTime.Now;
-                session.ReadObjects.Clear();
-                session.ReadObjects.AddRange(ParseObjects(
-                    "1.0.99.1.0.255:2;1.0.99.2.0.255:2;1.0.99.3.0.255:2;0.0.98.1.0.255:2;0.0.99.98.0.255:2;0.0.99.98.1.255:2;0.0.99.98.2.255:2;0.0.99.98.3.255:2;0.0.99.98.4.255:2;0.0.99.98.5.255:2;0.0.99.98.6.255:2;0.0.99.98.7.255:2"));
-
-                var profileResult = await ReadProfileDataAsync(session, now.Date,
-                    new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0), combinedCts.Token);
-
-                if (profileResult.Success)
-                {
-                    await _hardwareService.ProcessAndSaveProfileDataAsync(profileResult.Data, serial);
-                }
+                // 6. Read profiles — sequential, prioritized, incremental
+                var profileResults = await ReadProfilesSequentialAsync(session, serial, combinedCts.Token);
+                outcome.ProfileResults = profileResults;
 
                 // Success
                 outcome.Success = true;
@@ -953,35 +943,11 @@ namespace DLMS_SERVICE.Services
                     _logger.LogInformation("✅ Lecture principale réussie {Serial}", serial);
                 }
 
-                // 3️⃣ Lecture des profils (sans timeout individuel)
-                var profileStopwatch = System.Diagnostics.Stopwatch.StartNew();
-                var now = DateTime.Now;
-                var dateStart = now.Date;
-                var dateEnd = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0);
-                
-                session.ReadObjects.Clear();
-                session.ReadObjects.AddRange(ParseObjects(
-                    "1.0.99.1.0.255:2;1.0.99.2.0.255:2;1.0.99.3.0.255:2;0.0.98.1.0.255:2;0.0.99.98.0.255:2;0.0.99.98.1.255:2;0.0.99.98.2.255:2;0.0.99.98.3.255:2;0.0.99.98.4.255:2;0.0.99.98.5.255:2;0.0.99.98.6.255:2;0.0.99.98.7.255:2"));
-
-                var profileResult = await ReadProfileDataAsync(session, dateStart, dateEnd, combinedCts.Token);
-                profileStopwatch.Stop();
-                
-                _logger.LogInformation("⏱️ Lecture profils {Serial} terminée en {ElapsedMs}ms", serial, profileStopwatch.ElapsedMilliseconds);
-                
-                if (!profileResult.Success)
-                {
-                    _logger.LogWarning("⚠️ Profils échoués {Serial}: {Error}", serial, profileResult.ErrorMessage);
-                }
-                else
-                {
-                    var saveStopwatch = System.Diagnostics.Stopwatch.StartNew();
-                    await _hardwareService.ProcessAndSaveProfileDataAsync(
-                        profileResult.Data, serial);
-                    saveStopwatch.Stop();
-                    
-                    _logger.LogInformation("⏱️ Sauvegarde profils {Serial} terminée en {ElapsedMs}ms", serial, saveStopwatch.ElapsedMilliseconds);
-                    _logger.LogInformation("✅ Profils réussis {Serial}", serial);
-                }
+                // Profile reading — sequential, prioritized, incremental
+                var profileResults = await ReadProfilesSequentialAsync(session, serial, combinedCts.Token);
+                var profilesRead = profileResults.Count(p => p.Success);
+                _logger.LogDebug("{Serial}: {Count}/{Total} profils lus via ReadMeterWithExistingSession",
+                    serial, profilesRead, profileResults.Count);
 
                 // 📊 Enregistrer les métriques de succès
                 try

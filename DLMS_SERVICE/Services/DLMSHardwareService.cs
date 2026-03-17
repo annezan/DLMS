@@ -28,6 +28,7 @@ namespace DLMS_SERVICE.Services
         Task<DLMSReadResult> ReadInstantAsync(DLMSReadRequest request);
         Task<DLMSReadResult> ReadProfileAsync(DLMSReadRequest request);
         Task ProcessAndSaveProfileDataAsync(string data, string serialNumber);
+        Task<int> ProcessAndSaveSingleProfileAsync(string data, string serialNumber, string profileObis);
         Task ProcessAndSaveCommandsDataAsync(string data, string serialNumber, int commandeCompteurId);
         Task<int> GetNextTentativeNumberAsync(int commandeCompteurId);
         Task<bool> CheckAndArchiveCommandIfAllCompteursArchivedAsync(int commandeId);
@@ -645,6 +646,231 @@ namespace DLMS_SERVICE.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Erreur lors du traitement et de l'enregistrement des données de profil pour {SerialNumber}", serialNumber);
+            }
+        }
+
+        public async Task<int> ProcessAndSaveSingleProfileAsync(string data, string serialNumber, string profileObis)
+        {
+            try
+            {
+                _logger.LogDebug("Traitement profil unique {ProfileObis} pour {SerialNumber}", profileObis, serialNumber);
+
+                var entries = JsonConvert.DeserializeObject<List<KeyValuePair<object[], object[]>>>(data);
+
+                if (entries == null || entries.Count == 0)
+                {
+                    _logger.LogWarning("Aucune donnée de profil à traiter pour {SerialNumber} / {ProfileObis}", serialNumber, profileObis);
+                    return 0;
+                }
+
+                using var scope = _serviceProvider.CreateScope();
+                var context = scope.ServiceProvider.GetRequiredService<DLMSDBContext>();
+
+                // Lookup profile generic via Join on CodeObis
+                var profilGenericResult = await context.Gxdlmsprofilgenerics
+                    .Join(context.CodeObis,
+                        pg => pg.CodeObisId,
+                        co => co.Id,
+                        (pg, co) => new { ProfilGeneric = pg, CodeObisValue = co.Value })
+                    .FirstOrDefaultAsync(x => x.CodeObisValue == profileObis);
+
+                if (profilGenericResult == null)
+                {
+                    _logger.LogWarning("Profil générique non trouvé pour {ProfileObis}", profileObis);
+                    return 0;
+                }
+
+                var profilGeneric = profilGenericResult.ProfilGeneric;
+
+                // Preload OBIS codes from entry.Value
+                var allObisValues = entries
+                    .SelectMany(e => e.Value.Select(v => v?.ToString()))
+                    .Where(s => !string.IsNullOrEmpty(s))
+                    .Distinct()
+                    .ToList();
+
+                var codeObisDict = (await context.CodeObis
+                    .Where(c => allObisValues.Contains(c.Value))
+                    .ToListAsync())
+                    .GroupBy(c => c.Value)
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                // Preload events
+                var eventsDict = (await context.Events
+                    .Where(e => e.Category == "EVENTS_GROUP_ALL_REGISTERS")
+                    .ToListAsync())
+                    .GroupBy(e => e.Value)
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                // Disable EF tracking
+                context.ChangeTracker.AutoDetectChangesEnabled = false;
+                context.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
+
+                // Determine if register or event profile
+                var registerProfiles = new HashSet<string> { "1.0.99.1.0.255", "1.0.99.2.0.255", "1.0.99.3.0.255", "0.0.98.1.0.255" };
+                bool isRegisterProfile = registerProfiles.Contains(profileObis);
+
+                var detailsToAdd = new List<Gxdlmsprofilgenericdetail>();
+                var eventsToAdd = new List<Gxdlmsprofilgenericdetailsevent>();
+
+                foreach (var entry in entries)
+                {
+                    if (entry.Key.Length == 0 || entry.Value.Length == 0)
+                        continue;
+
+                    DateTime dateUtc = DateTime.UtcNow;
+
+                    foreach (var row in entry.Key)
+                    {
+                        if (row is IEnumerable<object> values)
+                        {
+                            var array = values.ToArray();
+
+                            for (int i = 0; i < entry.Value.Length; i++)
+                            {
+                                var objStr = entry.Value[i]?.ToString() ?? string.Empty;
+
+                                if (isRegisterProfile)
+                                {
+                                    // Register profile processing
+                                    var detailprofil = new Gxdlmsprofilgenericdetail();
+                                    var realValue = ((JValue)array[i]).Value;
+                                    bool isRegisterValue = realValue is decimal || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
+
+                                    if (i == 0)
+                                    {
+                                        if (DateTime.TryParse(array[i].ToString(), out DateTime dateValue))
+                                        {
+                                            long unixTimestamp = ((DateTimeOffset)dateValue).ToUnixTimeSeconds();
+                                            dateUtc = DateTimeOffset.FromUnixTimeSeconds(unixTimestamp).UtcDateTime;
+                                        }
+                                        else
+                                        {
+                                            _logger.LogWarning("Format de date invalide: {Date}", array[i]);
+                                            continue;
+                                        }
+                                    }
+
+                                    detailprofil.Value = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
+                                    detailprofil.CodeObisId = codeObisDict.TryGetValue(objStr, out var codeObis) ? codeObis.Id : 0;
+                                    detailprofil.DateEnr = dateUtc;
+                                    detailprofil.GxdlmsprofilgenericId = profilGeneric.Id;
+                                    detailprofil.NumeroCompteur = serialNumber;
+                                    detailprofil.IsArchive = false;
+
+                                    detailsToAdd.Add(detailprofil);
+                                }
+                                else
+                                {
+                                    // Event profile processing
+                                    var detailprofilevent = new Gxdlmsprofilgenericdetailsevent();
+
+                                    if (objStr.StartsWith("0.0.96.11."))
+                                    {
+                                        int valconvert = Convert.ToInt32(array[i]);
+
+                                        _logger.LogDebug("Recherche événement: valconvert={Valconvert}, eventsDict.Count={Count}",
+                                            valconvert, eventsDict.Count);
+
+                                        if (eventsDict.TryGetValue(valconvert, out var eventResult))
+                                        {
+                                            detailprofilevent.EventId = eventResult?.Id;
+                                            _logger.LogDebug("Événement trouvé: Id={EventId}, Description={Description}",
+                                                eventResult?.Id, eventResult?.Code2);
+                                        }
+                                        else
+                                        {
+                                            _logger.LogWarning("Événement non trouvé pour la valeur: {Valconvert}", valconvert);
+                                            detailprofilevent.EventId = null;
+                                        }
+                                        detailprofilevent.Value = array[i]?.ToString() ?? string.Empty;
+                                    }
+                                    else
+                                    {
+                                        detailprofilevent.Value = array[i]?.ToString() ?? string.Empty;
+                                        detailprofilevent.EventId = null;
+                                    }
+
+                                    if (i == 0)
+                                    {
+                                        if (DateTime.TryParse(array[i].ToString(), out DateTime dateValue))
+                                        {
+                                            long unixTimestamp = ((DateTimeOffset)dateValue).ToUnixTimeSeconds();
+                                            dateUtc = DateTimeOffset.FromUnixTimeSeconds(unixTimestamp).UtcDateTime;
+                                        }
+                                        else
+                                        {
+                                            _logger.LogWarning("Format de date invalide: {Date}", array[i]);
+                                            continue;
+                                        }
+                                    }
+
+                                    detailprofilevent.DateEnr = dateUtc;
+                                    detailprofilevent.CodeObisId = codeObisDict.TryGetValue(objStr, out var codeObisEvent) ? codeObisEvent.Id : 0;
+                                    detailprofilevent.GxdlmsprofilgenericId = profilGeneric.Id;
+                                    detailprofilevent.NumeroCompteur = serialNumber;
+                                    detailprofilevent.IsArchive = false;
+
+                                    eventsToAdd.Add(detailprofilevent);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // BulkInsertOrUpdate with no-op update = "insert if not exists"
+                if (detailsToAdd.Count > 0)
+                {
+                    await context.BulkInsertOrUpdateAsync(detailsToAdd, new BulkConfig
+                    {
+                        SetOutputIdentity = false,
+                        BatchSize = 500,
+                        UpdateByProperties = new List<string>
+                        {
+                            nameof(Gxdlmsprofilgenericdetail.NumeroCompteur),
+                            nameof(Gxdlmsprofilgenericdetail.GxdlmsprofilgenericId),
+                            nameof(Gxdlmsprofilgenericdetail.CodeObisId),
+                            nameof(Gxdlmsprofilgenericdetail.DateEnr)
+                        },
+                        PropertiesToExcludeOnUpdate = new List<string>
+                        {
+                            nameof(Gxdlmsprofilgenericdetail.Value),
+                            nameof(Gxdlmsprofilgenericdetail.IsArchive)
+                        }
+                    });
+                }
+                if (eventsToAdd.Count > 0)
+                {
+                    await context.BulkInsertOrUpdateAsync(eventsToAdd, new BulkConfig
+                    {
+                        SetOutputIdentity = false,
+                        BatchSize = 500,
+                        UpdateByProperties = new List<string>
+                        {
+                            nameof(Gxdlmsprofilgenericdetailsevent.NumeroCompteur),
+                            nameof(Gxdlmsprofilgenericdetailsevent.GxdlmsprofilgenericId),
+                            nameof(Gxdlmsprofilgenericdetailsevent.CodeObisId),
+                            nameof(Gxdlmsprofilgenericdetailsevent.DateEnr)
+                        },
+                        PropertiesToExcludeOnUpdate = new List<string>
+                        {
+                            nameof(Gxdlmsprofilgenericdetailsevent.Value),
+                            nameof(Gxdlmsprofilgenericdetailsevent.IsArchive),
+                            nameof(Gxdlmsprofilgenericdetailsevent.EventId)
+                        }
+                    });
+                }
+
+                int totalInserted = detailsToAdd.Count + eventsToAdd.Count;
+                _logger.LogInformation("ProcessAndSaveSingleProfileAsync: {Count} entrées traitées pour {SerialNumber} / {ProfileObis}",
+                    totalInserted, serialNumber, profileObis);
+
+                return totalInserted;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Erreur lors du traitement profil unique {ProfileObis} pour {SerialNumber}", profileObis, serialNumber);
+                return 0;
             }
         }
 

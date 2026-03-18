@@ -44,7 +44,6 @@ public class ReadingCycleManager : IReadingCycleManager
     {
         using var scope = _serviceProvider.CreateScope();
         var cycleRepo = scope.ServiceProvider.GetRequiredService<IReadingCycleQueryRepository>();
-        var meterStatusRepo = scope.ServiceProvider.GetRequiredService<IMeterReadingStatusQueryRepository>();
         var commandRepo = scope.ServiceProvider.GetRequiredService<IReadingSessionCommandRepository>();
         var compteurEquipementUtilities = scope.ServiceProvider.GetRequiredService<CompteurEquipementUtilities>();
 
@@ -52,88 +51,44 @@ public class ReadingCycleManager : IReadingCycleManager
         var allMeters = await compteurEquipementUtilities.GetCompteurEquipement();
         if (allMeters == null || allMeters.Count == 0)
         {
-            _logger.LogWarning("Aucun compteur trouve pour le cycle de lecture");
+            _logger.LogWarning("Aucun compteur trouve pour la session de lecture");
             return (null!, new List<CompteurEquipement>());
         }
 
-        // Check for active cycle
+        // Close any active cycle (1 cycle = 1 session horaire, pas de multi-session)
         var activeCycle = await cycleRepo.GetActiveCycleAsync();
-
         if (activeCycle != null)
         {
-            // Check if cycle exhausted its sessions
-            if (activeCycle.SessionActuelle >= activeCycle.MaxSessions)
-            {
-                _logger.LogInformation(
-                    "Cycle #{CycleId} a atteint {Current}/{Max} sessions — fermeture et creation d'un nouveau cycle",
-                    activeCycle.Id, activeCycle.SessionActuelle, activeCycle.MaxSessions);
+            _logger.LogInformation(
+                "Fermeture cycle #{CycleId} (session precedente) — {Read}/{Total} compteurs lus",
+                activeCycle.Id, activeCycle.CompteursLus, activeCycle.TotalCompteurs);
 
-                activeCycle.Statut = ReadingCycleStatus.Termine;
-                activeCycle.DateFin = DateTime.Now;
-                activeCycle.UpdatedAt = DateTime.Now;
-                await commandRepo.UpdateCycleAsync(activeCycle);
-
-                activeCycle = null; // Force new cycle creation
-            }
-            else
-            {
-                // Get unread meters for this cycle
-                var unreadMeterIds = await meterStatusRepo.GetUnreadMeterIdsForCycleAsync(activeCycle.Id);
-                var metersToRead = allMeters.Where(m => unreadMeterIds.Contains(m.Id)).ToList();
-
-                if (metersToRead.Count == 0)
-                {
-                    _logger.LogInformation(
-                        "Cycle #{CycleId} : tous les compteurs ont ete lus — fermeture et nouveau cycle",
-                        activeCycle.Id);
-
-                    activeCycle.Statut = ReadingCycleStatus.Termine;
-                    activeCycle.DateFin = DateTime.Now;
-                    activeCycle.CompteursLus = activeCycle.TotalCompteurs;
-                    activeCycle.UpdatedAt = DateTime.Now;
-                    await commandRepo.UpdateCycleAsync(activeCycle);
-
-                    activeCycle = null; // Force new cycle
-                }
-                else
-                {
-                    _logger.LogInformation(
-                        "Cycle #{CycleId} actif — session {Current}/{Max}, {Unread}/{Total} compteurs non-lus",
-                        activeCycle.Id, activeCycle.SessionActuelle + 1, activeCycle.MaxSessions,
-                        metersToRead.Count, activeCycle.TotalCompteurs);
-
-                    return (activeCycle, metersToRead);
-                }
-            }
+            activeCycle.Statut = ReadingCycleStatus.Termine;
+            activeCycle.DateFin = DateTime.Now;
+            activeCycle.UpdatedAt = DateTime.Now;
+            await commandRepo.UpdateCycleAsync(activeCycle);
         }
 
-        // Create new cycle
+        // Create new cycle — 1 session avec TOUS les compteurs
+        // Les profils sont lus en incremental (MeterProfileReadHistory),
+        // donc relire un compteur deja lu est quasi-gratuit.
         var newCycle = new ReadingCycle
         {
-            Libelle = $"Cycle {DateTime.Now:yyyy-MM-dd HH:mm}",
+            Libelle = $"Session {DateTime.Now:yyyy-MM-dd HH:mm}",
             DateDebut = DateTime.Now,
             Statut = ReadingCycleStatus.EnCours,
             TotalCompteurs = allMeters.Count,
             CompteursLus = 0,
-            MaxSessions = 10, // Default, can be overridden by DB config
+            MaxSessions = 1,
             SessionActuelle = 0,
             CreatedAt = DateTime.Now,
             CreatedBy = "system"
         };
 
-        // Try to get MaxSessions from DB config
-        try
-        {
-            var configs = await cycleRepo.GetAllAsync(c => !c.IsArchive);
-            // configs is for ReadingCycle, we need ReadingConfiguration instead
-            // We'll use the default for now - overridable via appsettings
-        }
-        catch { /* Use default */ }
-
         newCycle = await commandRepo.AddCycleAsync(newCycle);
 
         _logger.LogInformation(
-            "Nouveau cycle #{CycleId} cree — {Total} compteurs",
+            "Nouvelle session #{CycleId} — {Total} compteurs (tous, lecture incrementale)",
             newCycle.Id, newCycle.TotalCompteurs);
 
         return (newCycle, allMeters);
@@ -146,7 +101,6 @@ public class ReadingCycleManager : IReadingCycleManager
     {
         using var scope = _serviceProvider.CreateScope();
         var commandRepo = scope.ServiceProvider.GetRequiredService<IReadingSessionCommandRepository>();
-        var meterStatusRepo = scope.ServiceProvider.GetRequiredService<IMeterReadingStatusQueryRepository>();
 
         // 1. Create ReadingSession record
         var session = new ReadingSession
@@ -272,15 +226,16 @@ public class ReadingCycleManager : IReadingCycleManager
 
         await commandRepo.BulkInsertIpSessionStatsAsync(ipStatsEntities);
 
-        // 5. Update cycle
-        var readCount = await meterStatusRepo.GetReadCountForCycleAsync(cycle.Id);
-        cycle.CompteursLus = readCount;
-        cycle.SessionActuelle++;
+        // 5. Close cycle (1 cycle = 1 session horaire)
+        cycle.CompteursLus = report.TotalSucceeded;
+        cycle.SessionActuelle = 1;
+        cycle.Statut = ReadingCycleStatus.Termine;
+        cycle.DateFin = DateTime.Now;
         cycle.UpdatedAt = DateTime.Now;
         await commandRepo.UpdateCycleAsync(cycle);
 
         _logger.LogInformation(
-            "Cycle #{CycleId} mis a jour : session {Current}/{Max}, {Read}/{Total} compteurs lus",
-            cycle.Id, cycle.SessionActuelle, cycle.MaxSessions, readCount, cycle.TotalCompteurs);
+            "Session #{CycleId} terminee : {Read}/{Total} compteurs lus ({Rate:F1}%)",
+            cycle.Id, report.TotalSucceeded, cycle.TotalCompteurs, report.TauxReussite);
     }
 }

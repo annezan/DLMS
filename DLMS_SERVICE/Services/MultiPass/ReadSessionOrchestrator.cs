@@ -594,7 +594,7 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
             DateDebut = DateTime.Now
         };
         var budget = new PassBudget(effectiveBudget);
-        const int MeterTimeoutSeconds = 180;
+        const int MeterTimeoutSeconds = 60; // Réduit: si un compteur ne répond pas en 60s, inutile d'attendre 180s
 
         _logger.LogInformation(
             "=== PASS RESCUE ({Budget}s budget, {Count} compteurs, mode sequentiel) ===",
@@ -720,68 +720,96 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
 
             _logger.LogInformation("[Rescue] {IpKey} connecte — lecture de {Count} compteurs", ipKey, group.Count());
 
-            try
+            int okCount = 0;
+            foreach (var meter in group)
             {
-                int okCount = 0;
-                foreach (var meter in group)
+                if (budget.IsExpired)
                 {
-                    if (budget.IsExpired)
+                    passResult.Results.Add(new MeterReadOutcome
                     {
-                        passResult.Results.Add(new MeterReadOutcome
-                        {
-                            Serial = meter.Compteur?.NumeroCompteur ?? "",
-                            Ip = meter.Equipement?.AdresseIp ?? "",
-                            Port = meter.Equipement?.Port ?? "",
-                            CompteurEquipementId = meter.Id,
-                            Error = "Budget expire (rescue)",
-                            ResultCategory = MeterReadingResult.BudgetExpire
-                        });
-                        continue;
-                    }
-
-                    var serial = meter.Compteur?.NumeroCompteur ?? "";
-                    MeterReadOutcome meterResult;
-                    try
-                    {
-                        meterResult = await _parallelReadService.ReadSingleMeterOnSessionAsync(
-                            session, meter, TimeSpan.FromSeconds(MeterTimeoutSeconds), ct);
-                    }
-                    catch (Exception ex)
-                    {
-                        meterResult = new MeterReadOutcome
-                        {
-                            Serial = serial,
-                            Ip = meter.Equipement?.AdresseIp ?? "",
-                            Port = meter.Equipement?.Port ?? "",
-                            CompteurEquipementId = meter.Id,
-                            Error = ex.Message,
-                            ResultCategory = MeterReadingResult.EchecLecture
-                        };
-                    }
-
-                    passResult.Results.Add(meterResult);
-
-                    if (meterResult.Success)
-                    {
-                        okCount++;
-                        _logger.LogDebug("[Rescue] {Serial} OK ({TotalMs}ms)", serial, meterResult.TotalMs);
-                    }
-                    else
-                    {
-                        _logger.LogDebug("[Rescue] {Serial} ECHEC — {Error}", serial, meterResult.Error);
-                    }
-
-                    // Pacing delay
-                    await Task.Delay(globalConfig.PacingDelayMs, ct);
+                        Serial = meter.Compteur?.NumeroCompteur ?? "",
+                        Ip = meter.Equipement?.AdresseIp ?? "",
+                        Port = meter.Equipement?.Port ?? "",
+                        CompteurEquipementId = meter.Id,
+                        Error = "Budget expire (rescue)",
+                        ResultCategory = MeterReadingResult.BudgetExpire
+                    });
+                    continue;
                 }
 
-                _logger.LogInformation("[Rescue] {IpKey} : {OK}/{Total} OK",
-                    ipKey, okCount, group.Count());
+                var serial = meter.Compteur?.NumeroCompteur ?? "";
+                MeterReadOutcome meterResult;
+                try
+                {
+                    meterResult = await _parallelReadService.ReadSingleMeterOnSessionAsync(
+                        session, meter, TimeSpan.FromSeconds(MeterTimeoutSeconds), ct);
+                }
+                catch (Exception ex)
+                {
+                    meterResult = new MeterReadOutcome
+                    {
+                        Serial = serial,
+                        Ip = meter.Equipement?.AdresseIp ?? "",
+                        Port = meter.Equipement?.Port ?? "",
+                        CompteurEquipementId = meter.Id,
+                        Error = ex.Message,
+                        ResultCategory = MeterReadingResult.EchecLecture
+                    };
+                }
+
+                passResult.Results.Add(meterResult);
+
+                if (meterResult.Success)
+                {
+                    okCount++;
+                    _logger.LogDebug("[Rescue] {Serial} OK ({TotalMs}ms)", serial, meterResult.TotalMs);
+                }
+                else
+                {
+                    _logger.LogDebug("[Rescue] {Serial} ECHEC — {Error}", serial, meterResult.Error);
+
+                    // Reconnexion TCP complète après échec pour éviter la cascade
+                    // (la session HDLC est corrompue après un timeout GetAssociationView)
+                    try { await session.DisconnectAsync(); } catch { }
+                    await Task.Delay(500, ct); // laisser le concentrateur respirer
+
+                    session = _sessionFactory.CreateSession(transportParams);
+                    using var reconnCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+                    using var reconnLinked = CancellationTokenSource.CreateLinkedTokenSource(ct, reconnCts.Token);
+                    var reconnOk = await session.OpenTransportAsync(reconnLinked.Token);
+                    if (!reconnOk)
+                    {
+                        _logger.LogWarning("[Rescue] Reconnexion TCP {IpKey} echouee, skip {Count} compteurs restants",
+                            ipKey, group.Count() - okCount - passResult.Results.Count(r => r.Ip == firstMeter.Equipement?.AdresseIp && !r.Success));
+
+                        // Marquer les compteurs restants non encore traités
+                        foreach (var remaining in group.Where(m =>
+                            !passResult.Results.Any(r => r.Serial == (m.Compteur?.NumeroCompteur ?? ""))))
+                        {
+                            passResult.Results.Add(new MeterReadOutcome
+                            {
+                                Serial = remaining.Compteur?.NumeroCompteur ?? "",
+                                Ip = remaining.Equipement?.AdresseIp ?? "",
+                                Port = remaining.Equipement?.Port ?? "",
+                                CompteurEquipementId = remaining.Id,
+                                Error = "Reconnexion TCP echouee (rescue)",
+                                ResultCategory = MeterReadingResult.EchecLecture
+                            });
+                        }
+                        break; // Passer à l'IP suivante
+                    }
+                    _logger.LogDebug("[Rescue] Reconnexion TCP {IpKey} OK", ipKey);
+                }
+
+                // Pacing delay
+                await Task.Delay(globalConfig.PacingDelayMs, ct);
             }
-            finally
-            {
-                await session.DisconnectAsync();
-            }
+
+            // Disconnect final
+            try { await session.DisconnectAsync(); } catch { }
+
+            _logger.LogInformation("[Rescue] {IpKey} : {OK}/{Total} OK",
+                ipKey, okCount, group.Count());
         }
 
         passResult.ElapsedMs = budget.ElapsedMs;

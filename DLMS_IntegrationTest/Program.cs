@@ -366,6 +366,9 @@ class Program
         // Prevent thread pool starvation from synchronous Gurux HDLC calls
         ThreadPool.SetMinThreads(50, 50);
 
+        // S'assurer que le dossier cache d'association existe
+        Directory.CreateDirectory("associations");
+
         Console.WriteLine("=== Test d'integration DLMS/COSEM ===");
         Console.WriteLine();
 
@@ -993,7 +996,7 @@ class Program
     {
         var passResult = new PassResult { PassNumber = passConfig.PassNumber };
         var budget = new PassBudget(effectiveBudget);
-        const int MeterTimeoutSeconds = 180;
+        const int MeterTimeoutSeconds = 60; // Réduit: inutile d'attendre 180s pour un compteur mort
 
         Console.WriteLine($"=== PASS RESCUE ({effectiveBudget}s budget, {metersToRead.Count} compteurs, mode sequentiel) ===");
         Console.WriteLine();
@@ -1092,61 +1095,80 @@ class Program
 
             Console.WriteLine($"  [Rescue] {ipKey} connecte — {group.Count()} compteurs");
 
-            try
+            int okCount = 0;
+            foreach (var meter in group)
             {
-                int okCount = 0;
-                foreach (var meter in group)
+                if (budget.IsExpired)
                 {
-                    if (budget.IsExpired)
+                    passResult.Results.Add(new MeterResult
                     {
-                        passResult.Results.Add(new MeterResult
-                        {
-                            Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
-                            Error = "Budget expire (rescue)"
-                        });
-                        continue;
-                    }
-
-                    Console.Write($"    [Rescue] {meter.Serial} ... ");
-
-                    MeterResult meterResult;
-                    try
-                    {
-                        meterResult = await ReadSingleMeter(session, meter, keyService)
-                            .WaitAsync(TimeSpan.FromSeconds(MeterTimeoutSeconds));
-                    }
-                    catch (TimeoutException)
-                    {
-                        meterResult = new MeterResult
-                        {
-                            Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
-                            Error = $"Timeout ({MeterTimeoutSeconds}s)"
-                        };
-                        try { session.Reader?.Disconnect(); } catch { }
-                    }
-
-                    passResult.Results.Add(meterResult);
-
-                    if (meterResult.Success)
-                    {
-                        okCount++;
-                        Console.WriteLine($"OK (HDLC:{meterResult.HdlcMs}ms, Lecture:{meterResult.ReadMs}ms)");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"ECHEC - {meterResult.Error}");
-                    }
-
-                    await Task.Delay(100); // pacing
+                        Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
+                        Error = "Budget expire (rescue)"
+                    });
+                    continue;
                 }
 
-                Console.WriteLine($"  [Rescue] {ipKey} : {okCount}/{group.Count()} OK");
-                Console.WriteLine();
+                Console.Write($"    [Rescue] {meter.Serial} ... ");
+
+                MeterResult meterResult;
+                try
+                {
+                    meterResult = await ReadSingleMeter(session, meter, keyService)
+                        .WaitAsync(TimeSpan.FromSeconds(MeterTimeoutSeconds));
+                }
+                catch (TimeoutException)
+                {
+                    meterResult = new MeterResult
+                    {
+                        Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
+                        Error = $"Timeout ({MeterTimeoutSeconds}s)"
+                    };
+                    try { session.Reader?.Disconnect(); } catch { }
+                }
+
+                passResult.Results.Add(meterResult);
+
+                if (meterResult.Success)
+                {
+                    okCount++;
+                    Console.WriteLine($"OK (HDLC:{meterResult.HdlcMs}ms, Lecture:{meterResult.ReadMs}ms)");
+                }
+                else
+                {
+                    Console.WriteLine($"ECHEC - {meterResult.Error}");
+
+                    // Reconnexion TCP complète après échec (session HDLC corrompue)
+                    try { await session.DisconnectAsync(); } catch { }
+                    await Task.Delay(500); // laisser le concentrateur respirer
+
+                    session = sessionFactory.CreateSession(transportParams);
+                    using var reconnCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+                    var reconnOk = await session.OpenTransportAsync(reconnCts.Token);
+                    if (!reconnOk)
+                    {
+                        Console.WriteLine($"    [Rescue] Reconnexion TCP {ipKey} ECHEC, skip restants");
+                        foreach (var remaining in group.Where(m =>
+                            !passResult.Results.Any(r => r.Serial == m.Serial)))
+                        {
+                            passResult.Results.Add(new MeterResult
+                            {
+                                Serial = remaining.Serial, Ip = remaining.Ip, Port = remaining.Port,
+                                Error = "Reconnexion TCP echouee (rescue)"
+                            });
+                        }
+                        break;
+                    }
+                    Console.WriteLine($"    [Rescue] Reconnexion TCP OK");
+                }
+
+                await Task.Delay(100); // pacing
             }
-            finally
-            {
-                await session.DisconnectAsync();
-            }
+
+            // Disconnect final
+            try { await session.DisconnectAsync(); } catch { }
+
+            Console.WriteLine($"  [Rescue] {ipKey} : {okCount}/{group.Count()} OK");
+            Console.WriteLine();
         }
 
         passResult.ElapsedMs = budget.ElapsedMs;

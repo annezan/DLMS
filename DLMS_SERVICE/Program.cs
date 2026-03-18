@@ -43,6 +43,10 @@ namespace DLMS_SERVICE
             {
                 Log.Information("=== Démarrage du service DLMS ===");
 
+                // S'assurer que le dossier cache d'association existe
+                // (évite les échecs silencieux de sauvegarde du cache XML Gurux)
+                Directory.CreateDirectory("associations");
+
                 if (Environment.UserInteractive)
                 {
                     Log.Information("Mode: Console interactif");

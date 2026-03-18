@@ -30,9 +30,22 @@ Priorite 3 : compteur avec cache d'association (Fast/Medium)
 Priorite 4 : compteur deja echoue (comportement actuel, dernier recours)
 ```
 
-Le `successfulSerials` (HashSet deja maintenu ligne 93) est passe au selecteur.
+**Note sur Pass 1** : au demarrage, tous les compteurs sont Unknown (MeterHealthTracker est in-memory, pas persiste). Les priorites 1, 2, 3 collapsent au meme resultat. C'est attendu — la selection intelligente est surtout utile aux passes 2 et 3.
 
-**Signature** :
+**Changement de signature requis** : `RunSinglePassAsync` doit recevoir `successfulSerials` en parametre additionnel car il est defini dans `RunSessionAsync` (ligne 57) mais utilise dans `RunSinglePassAsync` (ligne 168). Ajouter le parametre a la signature :
+
+```csharp
+// Avant
+private async Task<PassResult> RunSinglePassAsync(
+    List<CompteurEquipement> meters, PassConfig passConfig, ...)
+
+// Apres
+private async Task<PassResult> RunSinglePassAsync(
+    List<CompteurEquipement> meters, PassConfig passConfig,
+    HashSet<string> successfulSerials, ...)
+```
+
+**Signature SelectCanaryMeter** :
 ```csharp
 private CompteurEquipement SelectCanaryMeter(
     List<CompteurEquipement> meterList,
@@ -47,16 +60,23 @@ Actuellement : Pass 1/2 tentent 1 seul canary. Pass 3 tente 3 canary (lignes 383
 
 **Nouveau** : toutes les passes tentent jusqu'a 3 canary differents avant d'abandonner l'IP. Les candidats suivent l'ordre de priorite du point 1. Si un canary echoue, il est retire de la liste et le suivant est teste.
 
+**Gestion de la session TCP entre canary** : la session TCP (transport) est ouverte au niveau IP, pas au niveau compteur. Apres un echec canary, le transport peut etre dans un etat indetermine. Regle :
+- Apres chaque echec canary, appeler `session.Reader?.Disconnect()` puis `session.Reader?.InitializeConnection()` avant de tenter le candidat suivant
+- Si la reconnexion echoue, considerer l'IP comme inaccessible et passer au deferral
+
+**Note** : la session TCP (`OpenTransportAsync`) est partagee par tous les compteurs d'un meme concentrateur — elle utilise l'IP du premier compteur du groupe. Tous les compteurs du groupe partagent la meme IP/port, donc le transport ouvert est valide pour n'importe quel compteur du groupe.
+
 ```
 Pour chaque IP :
+  session = OpenTransport(ip)
   candidats = SelectCanaryCandidates(meterList, successfulSerials, max=3)
   pour chaque candidat :
     resultat = ReadSingleMeterOnSessionAsync(candidat, canaryTimeout)
     si succes → utiliser comme canary, lire les autres compteurs
-    si echec → tenter le candidat suivant
-  si tous echouent :
-    Pass < 3 → differer IP et compteurs non-testes
-    Pass 3 → abandon definitif
+    si echec → Disconnect + Reconnect, tenter le candidat suivant
+  si tous echouent ou reconnexion echoue :
+    Pass < 3 → differer compteurs non-testes, IP differee
+    Pass 3 → abandon definitif (compteurs echoues), BudgetExpire (jamais testes)
 ```
 
 **Signature** :
@@ -87,24 +107,33 @@ Modifier les valeurs de `CanaryTimeoutSeconds` dans la config des passes :
 
 Actuellement : pause fixe = `passConfig.PauseAfterSeconds` (300s = 5 min).
 
-**Nouveau** : la pause est proportionnelle au nombre d'IPs distinctes restantes dans le scope.
+**Nouveau** : la pause est proportionnelle au nombre d'IPs distinctes dans `currentMeters` (la liste post-filtre a la ligne 95-96, apres suppression des compteurs deja lus). C'est le bon point de calcul car il reflete les IPs ayant encore des compteurs a lire pour la passe suivante.
 
 ```csharp
-// Remplace Task.Delay(passConfig.PauseAfterSeconds)
+// Remplace la logique a la ligne 106-110
 var uniqueIps = currentMeters
     .Select(m => m.Equipement?.AdresseIp)
+    .Where(ip => ip != null)
     .Distinct().Count();
 
-int pauseSeconds;
+int actualPauseSeconds;
 if (uniqueIps <= 3)
-    pauseSeconds = 0;           // pas de pause pour peu d'IPs
+    actualPauseSeconds = 0;
 else if (uniqueIps <= 10)
-    pauseSeconds = 120;         // 2 min
+    actualPauseSeconds = 120;
 else
-    pauseSeconds = passConfig.PauseAfterSeconds; // 5 min (defaut)
+    actualPauseSeconds = passConfig.PauseAfterSeconds;
+
+if (actualPauseSeconds > 0 && currentMeters.Count > 0)
+{
+    _logger.LogInformation("Pause {PauseSec}s avant Pass {NextPass} ({IpCount} IPs restantes)",
+        actualPauseSeconds, passIndex + 2, uniqueIps);
+    await Task.Delay(TimeSpan.FromSeconds(actualPauseSeconds), ct);
+    report.TotalPauseMs += actualPauseSeconds * 1000; // comptabiliser la pause reelle
+}
 ```
 
-**Condition supplementaire** : si `pauseSeconds > 0`, on garde le `Task.Delay` et le log. Sinon on skip.
+**Note** : `report.TotalPauseMs` doit utiliser `actualPauseSeconds` (la pause reellement effectuee) et non `passConfig.PauseAfterSeconds` (la valeur de config).
 
 ### 5. Separation du sort des compteurs et de l'IP
 
@@ -112,21 +141,27 @@ else
 
 Actuellement : si le canary echoue, tous les compteurs de l'IP sont differes (Pass <3) ou abandonnes (Pass 3).
 
-**Nouveau** : quand les 3 canary echouent en Pass <3, on ne differe pas aveuglementous les compteurs. On distingue :
+**Nouveau** : quand les 3 canary echouent, on applique un deferral granulaire.
 
-- **Compteurs deja lus avec succes** dans ce cycle → retires du scope (deja OK, pas besoin de retenter)
-- **Compteurs echoues (canary compris)** → differes pour la passe suivante
-- **Compteurs jamais testes** → differes pour la passe suivante (pas abandonnes)
+**En Pass < 3** (deferral) :
+- Compteurs deja lus avec succes dans ce cycle → retires du scope (deja OK)
+- Tous les autres compteurs (echoues + jamais testes) → differes pour la passe suivante
+- IP differee
 
-En Pass 3, si les 3 canary echouent :
-- Les compteurs deja echoues 2+ fois → abandon definitif
-- Les compteurs jamais testes → marques `BudgetExpire` au lieu de `AbandonDefinitif` (plus clair pour le suivi)
+**En Pass 3** (final) :
+- Compteurs deja lus avec succes → ignores (deja OK)
+- Compteurs echoues comme canary dans cette passe → `AbandonDefinitif`
+- Autres compteurs (jamais testes ou echoues dans passes precedentes) → `BudgetExpire`
+
+**Determination "echoue comme canary"** : on maintient un `HashSet<string> failedCanarySerials` local a la boucle canary multi-tentatives. Les compteurs dans ce set sont marques `AbandonDefinitif`. Les autres sont `BudgetExpire`.
+
+Cela evite d'avoir besoin d'un compteur de tentatives par compteur a travers les passes — on se base uniquement sur l'echec dans la passe courante.
 
 ## Fichiers impactes
 
 | Fichier | Modification |
 |---------|-------------|
-| `ReadSessionOrchestrator.cs` | `SelectCanaryMeter`, `SelectCanaryCandidates`, boucle canary multi-tentatives, pauses adaptatives, logique de deferral granulaire |
+| `ReadSessionOrchestrator.cs` | `SelectCanaryMeter`, `SelectCanaryCandidates`, boucle canary multi-tentatives avec Disconnect/Reconnect, signature `RunSinglePassAsync` (ajout `successfulSerials`), pauses adaptatives avec `actualPauseSeconds`, deferral granulaire avec `failedCanarySerials` |
 | `MultiPassConfig.cs` ou `appsettings.json` | Reduction des `CanaryTimeoutSeconds` |
 | `scripts/` | Script SQL pour mettre a jour les timeouts en base si stockes dans `ReadingConfiguration` |
 
@@ -146,5 +181,5 @@ En Pass 3, si les 3 canary echouent :
 | Temps perdu par canary lent | 180-420s | 60-90s max |
 | Compteurs en abandon definitif (1 concentrateur) | 50-60% | <20% |
 | Pauses inutiles (1 concentrateur) | 10 min | 0 min |
-| Compteurs jamais testes mais abandonnes | oui (KATI: 11) | non (differes, pas abandonnes) |
+| Compteurs jamais testes mais abandonnes | oui (KATI: 11) | non (differes ou BudgetExpire) |
 | Taux de lecture par session | 22-52% | 50-70% estime |

@@ -87,6 +87,8 @@ class TestReport
     public ConcentratorStats? Stats { get; set; }
 }
 
+record CliOptions(string Mode, int PoolSize, string? FilterIp, string? FilterMeter);
+
 // ===== Multi-pass configuration =====
 
 class PassConfig
@@ -289,6 +291,74 @@ class Program
 {
     private static ILoggerFactory _loggerFactory = null!;
 
+    static CliOptions? ParseArgs(string[] args)
+    {
+        string? mode = null;
+        int poolSize = 10;
+        string? filterIp = null;
+        string? filterMeter = null;
+
+        int i = 0;
+        while (i < args.Length)
+        {
+            switch (args[i])
+            {
+                case "--list":
+                case "--seq":
+                    mode = args[i];
+                    break;
+                case "--parallel":
+                    mode = "--parallel";
+                    if (i + 1 < args.Length && int.TryParse(args[i + 1], out int ps) && ps > 0)
+                    {
+                        poolSize = ps;
+                        i++;
+                    }
+                    break;
+                case "--ip":
+                    if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
+                    {
+                        Console.WriteLine("  ERREUR: --ip necessite une adresse IP.");
+                        Console.WriteLine("  Usage: --ip <ADRESSE_IP>");
+                        return null;
+                    }
+                    filterIp = args[++i];
+                    break;
+                case "--meter":
+                    if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
+                    {
+                        Console.WriteLine("  ERREUR: --meter necessite un numero de serie.");
+                        Console.WriteLine("  Usage: --meter <NUMERO_SERIE>");
+                        return null;
+                    }
+                    filterMeter = args[++i];
+                    break;
+                default:
+                    // Not a known flag — leave as-is for single meter mode
+                    break;
+            }
+            i++;
+        }
+
+        if (filterIp != null && filterMeter != null)
+        {
+            Console.WriteLine("  ERREUR: --ip et --meter sont mutuellement exclusifs.");
+            Console.WriteLine("  Utilisez l'un ou l'autre, pas les deux.");
+            return null;
+        }
+
+        // Default mode when only a filter is provided
+        if (mode == null)
+        {
+            if (filterIp != null)
+                mode = "--parallel";
+            else
+                mode = "";
+        }
+
+        return new CliOptions(mode, poolSize, filterIp, filterMeter);
+    }
+
     static async Task<int> Main(string[] args)
     {
         var totalSw = Stopwatch.StartNew();
@@ -302,8 +372,12 @@ class Program
         // Créer le dossier cache pour les association views
         Directory.CreateDirectory("associations");
 
+        // Parse CLI arguments
+        var options = ParseArgs(args);
+        if (options == null) return 1;
+
         // Setup logging — reduce to Warning for batch modes, keep Debug for single meter
-        var isBatchMode = args.Length > 0 && (args[0] == "--seq" || args[0] == "--parallel");
+        var isBatchMode = options.Mode == "--seq" || options.Mode == "--parallel";
         var minLevel = isBatchMode ? Serilog.Events.LogEventLevel.Warning : Serilog.Events.LogEventLevel.Debug;
 
         Log.Logger = new LoggerConfiguration()
@@ -344,6 +418,24 @@ class Program
                 return 1;
             }
 
+            // Apply CLI filters
+            if (options.FilterIp != null)
+            {
+                meters = meters.Where(m => m.Ip == options.FilterIp).ToList();
+                Console.WriteLine($"  FILTRE: IP = {options.FilterIp} ({meters.Count} compteur(s))");
+            }
+            else if (options.FilterMeter != null)
+            {
+                meters = meters.Where(m => m.Serial == options.FilterMeter).ToList();
+                Console.WriteLine($"  FILTRE: Compteur = {options.FilterMeter} ({meters.Count} compteur(s))");
+            }
+
+            if (meters.Count == 0)
+            {
+                Console.WriteLine("  ERREUR: Aucun compteur ne correspond au filtre.");
+                return 1;
+            }
+
             // Assign indices and display
             var grouped = meters.GroupBy(m => $"{m.Ip}:{m.Port}").OrderBy(g => g.Key);
             int index = 1;
@@ -367,18 +459,28 @@ class Program
             Console.WriteLine();
 
             // ===== Route based on CLI arguments =====
-            var mode = args.Length > 0 ? args[0] : "";
 
-            if (mode == "--list")
+            if (options.Mode == "--list")
             {
                 Console.WriteLine("Mode liste uniquement. Commandes disponibles :");
                 Console.WriteLine("  dotnet run --project DLMS_IntegrationTest/ -- <numero>    Test un seul compteur");
                 Console.WriteLine("  dotnet run --project DLMS_IntegrationTest/ -- --seq       Lecture sequentielle");
                 Console.WriteLine("  dotnet run --project DLMS_IntegrationTest/ -- --parallel [N]  Lecture parallele (pool de N IPs, defaut 10)");
+                Console.WriteLine();
+                Console.WriteLine("  Filtres (combinables avec --seq ou --parallel) :");
+                Console.WriteLine("    --ip <ADRESSE_IP>       Tester uniquement les compteurs d'un concentrateur");
+                Console.WriteLine("    --meter <NUMERO_SERIE>  Tester un seul compteur par numero de serie");
+                Console.WriteLine();
+                Console.WriteLine("  Exemples :");
+                Console.WriteLine("    DLMS_IntegrationTest.exe --parallel --ip 10.60.8.185");
+                Console.WriteLine("    DLMS_IntegrationTest.exe --parallel 10 --ip 10.60.8.185");
+                Console.WriteLine("    DLMS_IntegrationTest.exe --seq --meter 58014077");
+                Console.WriteLine("    DLMS_IntegrationTest.exe --ip 10.60.8.185");
+                Console.WriteLine("    DLMS_IntegrationTest.exe --meter 58014077");
                 return 0;
             }
 
-            if (mode == "--seq")
+            if (options.Mode == "--seq")
             {
                 var report = await RunSequentialTest(metersWithKeys, dbOptions, dbSw.ElapsedMilliseconds, meters.Count, distinctIps);
                 report.TotalElapsedMs = totalSw.ElapsedMilliseconds;
@@ -386,12 +488,9 @@ class Program
                 return 0;
             }
 
-            if (mode == "--parallel")
+            if (options.Mode == "--parallel")
             {
-                int poolSize = 10; // default
-                if (args.Length > 1 && int.TryParse(args[1], out int ps) && ps > 0)
-                    poolSize = ps;
-                await RunParallelTest(metersWithKeys, dbOptions, dbSw.ElapsedMilliseconds, meters.Count, distinctIps, poolSize);
+                await RunParallelTest(metersWithKeys, dbOptions, dbSw.ElapsedMilliseconds, meters.Count, distinctIps, options.PoolSize);
                 // Report is printed inside RunParallelTest via PrintMultiPassReport
                 return 0;
             }
@@ -793,10 +892,23 @@ class Program
             }
             var effectiveBudget = (int)Math.Min(passConfig.BudgetSeconds, globalTimeLeft);
 
-            var passResult = await RunSinglePass(
-                metersToRead, passConfig, effectiveBudget,
-                sessionFactory, keyService, maxConcurrentIps,
-                concentratorStats, previousDeferredIps);
+            PassResult passResult;
+
+            if (passConfig.PassNumber >= 3)
+            {
+                // Pass 3: sequential rescue — no canary, no abandon, each meter gets 180s
+                passResult = await RunSequentialRescuePass(
+                    metersToRead, passConfig, effectiveBudget,
+                    sessionFactory, keyService);
+            }
+            else
+            {
+                // Pass 1-2: parallel with canary
+                passResult = await RunSinglePass(
+                    metersToRead, passConfig, effectiveBudget,
+                    sessionFactory, keyService, maxConcurrentIps,
+                    concentratorStats, previousDeferredIps);
+            }
 
             multiPassReport.Passes.Add(passResult);
             PrintPassSummary(passResult);
@@ -809,14 +921,25 @@ class Program
                 .ToList();
             previousDeferredIps = passResult.GetDeferredIpSet();
 
-            // Inter-pass pause
+            // Inter-pass pause (adaptive: skip if few IPs)
             if (passConfig.PauseAfterSeconds > 0 && metersToRead.Count > 0)
             {
-                var pauseMin = passConfig.PauseAfterSeconds / 60;
-                Console.WriteLine($"  Pause {pauseMin} min avant Pass {passConfig.PassNumber + 1} ({metersToRead.Count} compteurs restants)...");
-                Console.WriteLine();
-                await Task.Delay(TimeSpan.FromSeconds(passConfig.PauseAfterSeconds));
-                multiPassReport.TotalPauseMs += passConfig.PauseAfterSeconds * 1000;
+                var uniqueIps = metersToRead.Select(m => m.Ip).Distinct().Count();
+                int actualPauseSeconds;
+                if (uniqueIps <= 3)
+                    actualPauseSeconds = 0;
+                else if (uniqueIps <= 10)
+                    actualPauseSeconds = 120;
+                else
+                    actualPauseSeconds = passConfig.PauseAfterSeconds;
+
+                if (actualPauseSeconds > 0)
+                {
+                    Console.WriteLine($"  Pause {actualPauseSeconds}s avant Pass {passConfig.PassNumber + 1} ({metersToRead.Count} compteurs, {uniqueIps} IPs)...");
+                    Console.WriteLine();
+                    await Task.Delay(TimeSpan.FromSeconds(actualPauseSeconds));
+                    multiPassReport.TotalPauseMs += actualPauseSeconds * 1000;
+                }
             }
         }
 
@@ -853,6 +976,153 @@ class Program
         return multiPassReport;
     }
 
+
+    // ===== Multi-pass: sequential rescue pass (Pass 3) =====
+
+    private static async Task<PassResult> RunSequentialRescuePass(
+        List<MeterInfo> metersToRead,
+        PassConfig passConfig,
+        int effectiveBudget,
+        DLMSGuruxSessionFactory sessionFactory,
+        DLMSKeyService keyService)
+    {
+        var passResult = new PassResult { PassNumber = passConfig.PassNumber };
+        var budget = new PassBudget(effectiveBudget);
+        const int MeterTimeoutSeconds = 180;
+
+        Console.WriteLine($"=== PASS RESCUE ({effectiveBudget}s budget, {metersToRead.Count} compteurs, mode sequentiel) ===");
+        Console.WriteLine();
+
+        // TCP scan all IPs
+        var ipGroups = metersToRead.GroupBy(m => $"{m.Ip}:{m.Port}").ToList();
+        var allIps = ipGroups.Select(g => (g.First().Ip, g.First().Port)).Distinct().ToList();
+
+        Console.WriteLine($"[Rescue] Test TCP de {allIps.Count} IPs (timeout {PassConfig.TcpScanTimeoutSeconds}s)...");
+        var scanResults = await ParallelTcpScan(allIps, TimeSpan.FromSeconds(PassConfig.TcpScanTimeoutSeconds));
+        var reachableIps = new HashSet<string>(scanResults.Where(r => r.Reachable).Select(r => r.Key));
+        Console.WriteLine($"  Resultats: {reachableIps.Count}/{allIps.Count} IPs accessibles");
+        Console.WriteLine();
+
+        // Mark unreachable meters
+        foreach (var g in ipGroups.Where(g => !reachableIps.Contains($"{g.First().Ip}:{g.First().Port}")))
+        {
+            foreach (var m in g)
+            {
+                passResult.Results.Add(new MeterResult
+                {
+                    Serial = m.Serial, Ip = m.Ip, Port = m.Port,
+                    Error = "IP inaccessible (rescue)"
+                });
+            }
+        }
+
+        // Process reachable IPs sequentially — no canary, no abandon
+        foreach (var group in ipGroups.Where(g => reachableIps.Contains($"{g.First().Ip}:{g.First().Port}")))
+        {
+            if (budget.IsExpired)
+            {
+                Console.WriteLine($"  [Rescue] Budget expire, {group.Count()} compteurs restants");
+                foreach (var m in group)
+                {
+                    passResult.Results.Add(new MeterResult
+                    {
+                        Serial = m.Serial, Ip = m.Ip, Port = m.Port,
+                        Error = "Budget expire (rescue)"
+                    });
+                }
+                continue;
+            }
+
+            var firstMeter = group.First();
+            var ipKey = $"{firstMeter.Ip}:{firstMeter.Port}";
+
+            // Open TCP
+            var transportParams = new DLMSConnectionParameters
+            {
+                AddressIp = firstMeter.Ip,
+                Port = firstMeter.Port,
+                Trace = TraceLevel.Off
+            };
+            var session = sessionFactory.CreateSession(transportParams);
+            using var tcpCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            var tcpOk = await session.OpenTransportAsync(tcpCts.Token);
+
+            if (!tcpOk)
+            {
+                Console.WriteLine($"  [Rescue] TCP {ipKey} ECHEC");
+                foreach (var m in group)
+                {
+                    passResult.Results.Add(new MeterResult
+                    {
+                        Serial = m.Serial, Ip = m.Ip, Port = m.Port,
+                        Error = "TCP echec (rescue)"
+                    });
+                }
+                continue;
+            }
+
+            Console.WriteLine($"  [Rescue] {ipKey} connecte — {group.Count()} compteurs");
+
+            try
+            {
+                int okCount = 0;
+                foreach (var meter in group)
+                {
+                    if (budget.IsExpired)
+                    {
+                        passResult.Results.Add(new MeterResult
+                        {
+                            Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
+                            Error = "Budget expire (rescue)"
+                        });
+                        continue;
+                    }
+
+                    Console.Write($"    [Rescue] {meter.Serial} ... ");
+
+                    MeterResult meterResult;
+                    try
+                    {
+                        meterResult = await ReadSingleMeter(session, meter, keyService)
+                            .WaitAsync(TimeSpan.FromSeconds(MeterTimeoutSeconds));
+                    }
+                    catch (TimeoutException)
+                    {
+                        meterResult = new MeterResult
+                        {
+                            Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
+                            Error = $"Timeout ({MeterTimeoutSeconds}s)"
+                        };
+                        try { session.Reader?.Disconnect(); } catch { }
+                    }
+
+                    passResult.Results.Add(meterResult);
+
+                    if (meterResult.Success)
+                    {
+                        okCount++;
+                        Console.WriteLine($"OK (HDLC:{meterResult.HdlcMs}ms, Lecture:{meterResult.ReadMs}ms)");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"ECHEC - {meterResult.Error}");
+                    }
+
+                    await Task.Delay(100); // pacing
+                }
+
+                Console.WriteLine($"  [Rescue] {ipKey} : {okCount}/{group.Count()} OK");
+                Console.WriteLine();
+            }
+            finally
+            {
+                await session.DisconnectAsync();
+            }
+        }
+
+        passResult.ElapsedMs = budget.ElapsedMs;
+        return passResult;
+    }
 
     // ===== Multi-pass: single pass execution =====
 

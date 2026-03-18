@@ -76,8 +76,11 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
                 break;
             }
 
-            // Check global budget
-            var globalTimeLeft = config.GlobalCeilingSeconds - totalSw.Elapsed.TotalSeconds;
+            // Check global budget (hard ceiling 55 min to leave margin)
+            const int HardCeilingSeconds = 55 * 60; // 55 min = 3300s
+            var globalTimeLeft = Math.Min(
+                config.GlobalCeilingSeconds - totalSw.Elapsed.TotalSeconds,
+                HardCeilingSeconds - totalSw.Elapsed.TotalSeconds);
             if (globalTimeLeft < 60)
             {
                 _logger.LogWarning("Budget global expire ({Elapsed}s), arret des passes",
@@ -90,9 +93,10 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
 
             if (passConfig.PassNumber >= 3)
             {
-                // Pass 3+: sequential rescue — each meter gets a chance, no canary, no IP abandon
+                // Pass 3+: sequential rescue — use ALL remaining global time (up to 55 min hard ceiling)
+                var rescueBudget = (int)globalTimeLeft;
                 passResult = await RunSequentialRescuePassAsync(
-                    currentMeters, passConfig, effectiveBudget, config, ct);
+                    currentMeters, passConfig, rescueBudget, config, report, ct);
             }
             else
             {
@@ -581,6 +585,7 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
         PassConfig passConfig,
         int effectiveBudget,
         MultiPassConfig globalConfig,
+        ReadSessionReport sessionReport,
         CancellationToken ct)
     {
         var passResult = new PassResult
@@ -600,6 +605,14 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
             .Where(m => m.Equipement?.AdresseIp != null)
             .GroupBy(m => $"{m.Equipement.AdresseIp}:{(m.Equipement.Port ?? "4059")}")
             .ToList();
+
+        // Compute IP success rate from previous passes to sort rescue order
+        var ipSuccessRates = sessionReport.AllResults
+            .GroupBy(r => $"{r.Ip}:{r.Port}")
+            .Where(g => !string.IsNullOrEmpty(g.Key) && g.Key != ":")
+            .ToDictionary(
+                g => g.Key,
+                g => g.Count() > 0 ? (double)g.Count(r => r.Success) / g.Count() * 100 : 0);
 
         // TCP scan all IPs
         var allIps = ipGroups
@@ -632,9 +645,25 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
             }
         }
 
-        // Process reachable IPs sequentially
-        foreach (var group in ipGroups.Where(g =>
-            reachableIps.Contains($"{g.First().Equipement.AdresseIp}:{(g.First().Equipement.Port ?? "4059")}")))
+        // Process reachable IPs sequentially — sorted by success rate (best first, dead last)
+        var sortedReachableGroups = ipGroups
+            .Where(g => reachableIps.Contains($"{g.First().Equipement.AdresseIp}:{(g.First().Equipement.Port ?? "4059")}"))
+            .OrderByDescending(g =>
+            {
+                var ipKey = $"{g.First().Equipement.AdresseIp}:{(g.First().Equipement.Port ?? "4059")}";
+                return ipSuccessRates.TryGetValue(ipKey, out var rate) ? rate : -1;
+            })
+            .ToList();
+
+        _logger.LogInformation("[Rescue] Ordre de traitement: {Order}",
+            string.Join(", ", sortedReachableGroups.Select(g =>
+            {
+                var ipKey = $"{g.First().Equipement.AdresseIp}:{(g.First().Equipement.Port ?? "4059")}";
+                var rate = ipSuccessRates.TryGetValue(ipKey, out var r) ? r : 0;
+                return $"{ipKey}({rate:F0}%)";
+            })));
+
+        foreach (var group in sortedReachableGroups)
         {
             if (budget.IsExpired)
             {

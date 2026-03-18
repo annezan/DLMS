@@ -864,11 +864,11 @@ class Program
 
         var passConfigs = new[]
         {
-            new PassConfig(1, budget: 1200, canary: 180, cached: 180, uncached: 300,
+            new PassConfig(1, budget: 1200, canary: 60,  cached: 180, uncached: 300,
                            maxFails: 2, cooldownCount: 0, cooldownSeconds: 0,  pause: 300),
-            new PassConfig(2, budget: 900,  canary: 300, cached: 240, uncached: 360,
+            new PassConfig(2, budget: 900,  canary: 90,  cached: 240, uncached: 360,
                            maxFails: 3, cooldownCount: 1, cooldownSeconds: 15, pause: 300),
-            new PassConfig(3, budget: 600,  canary: 420, cached: 300, uncached: 420,
+            new PassConfig(3, budget: 600,  canary: 90,  cached: 300, uncached: 420,
                            maxFails: 5, cooldownCount: 1, cooldownSeconds: 30, pause: 0),
         };
 
@@ -883,8 +883,11 @@ class Program
                 break;
             }
 
-            // Check global budget
-            var globalTimeLeft = GlobalCeilingSeconds - totalSw.Elapsed.TotalSeconds;
+            // Check global budget (hard ceiling 55 min)
+            const int HardCeilingSeconds = 55 * 60;
+            var globalTimeLeft = Math.Min(
+                GlobalCeilingSeconds - totalSw.Elapsed.TotalSeconds,
+                HardCeilingSeconds - totalSw.Elapsed.TotalSeconds);
             if (globalTimeLeft < 60)
             {
                 Console.WriteLine("  Budget global expire, arret des passes.");
@@ -896,10 +899,11 @@ class Program
 
             if (passConfig.PassNumber >= 3)
             {
-                // Pass 3: sequential rescue — no canary, no abandon, each meter gets 180s
+                // Pass 3: sequential rescue — use ALL remaining time up to 55 min hard ceiling
+                var rescueBudget = (int)globalTimeLeft;
                 passResult = await RunSequentialRescuePass(
-                    metersToRead, passConfig, effectiveBudget,
-                    sessionFactory, keyService);
+                    metersToRead, passConfig, rescueBudget,
+                    sessionFactory, keyService, multiPassReport);
             }
             else
             {
@@ -984,7 +988,8 @@ class Program
         PassConfig passConfig,
         int effectiveBudget,
         DLMSGuruxSessionFactory sessionFactory,
-        DLMSKeyService keyService)
+        DLMSKeyService keyService,
+        MultiPassReport previousReport)
     {
         var passResult = new PassResult { PassNumber = passConfig.PassNumber };
         var budget = new PassBudget(effectiveBudget);
@@ -1003,6 +1008,14 @@ class Program
         Console.WriteLine($"  Resultats: {reachableIps.Count}/{allIps.Count} IPs accessibles");
         Console.WriteLine();
 
+        // Compute IP success rates from previous passes for smart ordering
+        var ipSuccessRates = previousReport.AllResults
+            .GroupBy(r => $"{r.Ip}:{r.Port}")
+            .Where(g => !string.IsNullOrEmpty(g.Key) && g.Key != ":")
+            .ToDictionary(
+                g => g.Key,
+                g => g.Count() > 0 ? (double)g.Count(r => r.Success) / g.Count() * 100 : 0);
+
         // Mark unreachable meters
         foreach (var g in ipGroups.Where(g => !reachableIps.Contains($"{g.First().Ip}:{g.First().Port}")))
         {
@@ -1016,8 +1029,24 @@ class Program
             }
         }
 
-        // Process reachable IPs sequentially — no canary, no abandon
-        foreach (var group in ipGroups.Where(g => reachableIps.Contains($"{g.First().Ip}:{g.First().Port}")))
+        // Process reachable IPs sequentially — sorted by success rate (best first, dead last)
+        var sortedGroups = ipGroups
+            .Where(g => reachableIps.Contains($"{g.First().Ip}:{g.First().Port}"))
+            .OrderByDescending(g =>
+            {
+                var ipKey = $"{g.First().Ip}:{g.First().Port}";
+                return ipSuccessRates.TryGetValue(ipKey, out var rate) ? rate : -1;
+            })
+            .ToList();
+
+        Console.WriteLine($"  [Rescue] Ordre: {string.Join(", ", sortedGroups.Select(g => {
+            var ipKey = $"{g.First().Ip}:{g.First().Port}";
+            var rate = ipSuccessRates.TryGetValue(ipKey, out var r) ? r : 0;
+            return $"{ipKey}({rate:F0}%)";
+        }))}");
+        Console.WriteLine();
+
+        foreach (var group in sortedGroups)
         {
             if (budget.IsExpired)
             {

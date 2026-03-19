@@ -65,86 +65,86 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
         var currentMeters = metersToRead.ToList();
         HashSet<string>? previousDeferredIps = null;
 
-        // Passes 1 & 2: parallel. Pass 3: sequential rescue (no canary, no abandon)
-        var orderedPasses = config.Passes.OrderBy(p => p.PassNumber).ToList();
+        // Architecture V4: Pass 1 parallele + Pass RESCUE isolee (TCP frais par compteur)
+        // Pas de Pass 2 parallele (rendement trop faible: 5-14 lus en 15 min)
+        const int HardCeilingSeconds = 55 * 60; // 55 min hard ceiling
 
-        foreach (var passConfig in orderedPasses)
+        // === PASS 1: Parallele ===
+        var pass1Config = config.Passes.OrderBy(p => p.PassNumber).First();
+        if (currentMeters.Count > 0)
         {
-            if (currentMeters.Count == 0)
-            {
-                _logger.LogInformation("Tous les compteurs ont ete lus, arret anticipe");
-                break;
-            }
-
-            // Check global budget (hard ceiling 55 min to leave margin)
-            const int HardCeilingSeconds = 55 * 60; // 55 min = 3300s
             var globalTimeLeft = Math.Min(
                 config.GlobalCeilingSeconds - totalSw.Elapsed.TotalSeconds,
                 HardCeilingSeconds - totalSw.Elapsed.TotalSeconds);
-            if (globalTimeLeft < 60)
+
+            if (globalTimeLeft >= 60)
             {
-                _logger.LogWarning("Budget global expire ({Elapsed}s), arret des passes",
-                    (int)totalSw.Elapsed.TotalSeconds);
-                break;
+                var effectiveBudget = (int)Math.Min(pass1Config.BudgetSeconds, globalTimeLeft);
+                var passResult = await RunSinglePassAsync(
+                    currentMeters, pass1Config, effectiveBudget, config,
+                    concentratorStats, previousDeferredIps, ct);
+
+                report.Passes.Add(passResult);
+
+                successfulSerials.UnionWith(
+                    passResult.Results.Where(r => r.Success).Select(r => r.Serial));
+                currentMeters = currentMeters
+                    .Where(m => !successfulSerials.Contains(m.Compteur?.NumeroCompteur ?? ""))
+                    .ToList();
+
+                _logger.LogInformation(
+                    "=== PASS 1 TERMINE ({Duration:F1} min) — {OK} lus, {Failed} echoues, {Deferred} differes ===",
+                    passResult.ElapsedMs / 60000.0, passResult.Succeeded, passResult.Failed, passResult.DeferredCount);
+
+                // Pause adaptative avant rescue
+                if (currentMeters.Count > 0)
+                {
+                    var uniqueIps = currentMeters
+                        .Select(m => m.Equipement?.AdresseIp)
+                        .Where(ip => ip != null).Distinct().Count();
+
+                    int pauseSeconds = uniqueIps <= 3 ? 0 : uniqueIps <= 10 ? 120 : pass1Config.PauseAfterSeconds;
+                    if (pauseSeconds > 0)
+                    {
+                        _logger.LogInformation("Pause {PauseSec}s avant Rescue ({Remaining} compteurs, {IpCount} IPs)",
+                            pauseSeconds, currentMeters.Count, uniqueIps);
+                        await Task.Delay(TimeSpan.FromSeconds(pauseSeconds), ct);
+                        report.TotalPauseMs += pauseSeconds * 1000;
+                    }
+                }
             }
-            var effectiveBudget = (int)Math.Min(passConfig.BudgetSeconds, globalTimeLeft);
+        }
 
-            PassResult passResult;
+        // === PASS RESCUE: Isolee (TCP frais par compteur) ===
+        if (currentMeters.Count > 0)
+        {
+            var globalTimeLeft = Math.Min(
+                config.GlobalCeilingSeconds - totalSw.Elapsed.TotalSeconds,
+                HardCeilingSeconds - totalSw.Elapsed.TotalSeconds);
 
-            if (passConfig.PassNumber >= 3)
+            if (globalTimeLeft >= 60)
             {
-                // Pass 3+: sequential rescue — use ALL remaining global time (up to 55 min hard ceiling)
+                var rescueConfig = config.Passes.OrderBy(p => p.PassNumber).Last();
                 var rescueBudget = (int)globalTimeLeft;
-                passResult = await RunSequentialRescuePassAsync(
-                    currentMeters, passConfig, rescueBudget, config, report, ct);
+
+                var rescueResult = await RunSequentialRescuePassAsync(
+                    currentMeters, rescueConfig, rescueBudget, config, report, ct);
+
+                report.Passes.Add(rescueResult);
+
+                successfulSerials.UnionWith(
+                    rescueResult.Results.Where(r => r.Success).Select(r => r.Serial));
+                currentMeters = currentMeters
+                    .Where(m => !successfulSerials.Contains(m.Compteur?.NumeroCompteur ?? ""))
+                    .ToList();
+
+                _logger.LogInformation(
+                    "=== RESCUE TERMINE ({Duration:F1} min) — {OK} lus, {Failed} echoues ===",
+                    rescueResult.ElapsedMs / 60000.0, rescueResult.Succeeded, rescueResult.Failed);
             }
             else
             {
-                // Pass 1-2: parallel with canary and IP logic
-                passResult = await RunSinglePassAsync(
-                    currentMeters, passConfig, effectiveBudget, config,
-                    concentratorStats, previousDeferredIps, ct);
-            }
-
-            report.Passes.Add(passResult);
-
-            // Remove successes, keep failures for next pass
-            successfulSerials.UnionWith(
-                passResult.Results.Where(r => r.Success).Select(r => r.Serial));
-            currentMeters = currentMeters
-                .Where(m => !successfulSerials.Contains(m.Compteur?.NumeroCompteur ?? ""))
-                .ToList();
-            previousDeferredIps = passResult.GetDeferredIpSet();
-
-            var passLabel = passConfig.PassNumber >= 3 ? "RESCUE" : $"PASS {passConfig.PassNumber}";
-            _logger.LogInformation(
-                "=== {Label}/{Total} TERMINE ({Duration:F1} min) — {OK} lus, {Failed} echoues, {Deferred} differes ===",
-                passLabel, orderedPasses.Count, passResult.ElapsedMs / 60000.0,
-                passResult.Succeeded, passResult.Failed, passResult.DeferredCount);
-
-            // Inter-pass pause (adaptive: skip if few IPs)
-            if (passConfig.PauseAfterSeconds > 0 && currentMeters.Count > 0)
-            {
-                var uniqueIps = currentMeters
-                    .Select(m => m.Equipement?.AdresseIp)
-                    .Where(ip => ip != null)
-                    .Distinct().Count();
-
-                int actualPauseSeconds;
-                if (uniqueIps <= 3)
-                    actualPauseSeconds = 0;
-                else if (uniqueIps <= 10)
-                    actualPauseSeconds = 120;
-                else
-                    actualPauseSeconds = passConfig.PauseAfterSeconds;
-
-                if (actualPauseSeconds > 0)
-                {
-                    _logger.LogInformation("Pause {PauseSec}s avant Pass {NextPass} ({Remaining} compteurs, {IpCount} IPs)",
-                        actualPauseSeconds, passConfig.PassNumber + 1, currentMeters.Count, uniqueIps);
-                    await Task.Delay(TimeSpan.FromSeconds(actualPauseSeconds), ct);
-                    report.TotalPauseMs += actualPauseSeconds * 1000;
-                }
+                _logger.LogWarning("Budget global insuffisant pour Rescue ({Elapsed}s)", (int)totalSw.Elapsed.TotalSeconds);
             }
         }
 
@@ -576,9 +576,9 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
     }
 
     /// <summary>
-    /// Pass 3 "rescue" : lecture sequentielle de tous les compteurs restants.
-    /// Pas de canary, pas d'abandon d'IP, pas de logique d'echecs consecutifs.
-    /// Chaque compteur a sa chance avec un timeout individuel de 180s.
+    /// Pass RESCUE : lecture isolee de chaque compteur — connexion TCP+HDLC fraiche par compteur.
+    /// Identique au comportement de --seq --meter qui lit 95% des compteurs "difficiles".
+    /// Pas de canary, pas d'abandon, pas de retry, pas de session partagee.
     /// </summary>
     private async Task<PassResult> RunSequentialRescuePassAsync(
         List<CompteurEquipement> metersToRead,
@@ -594,223 +594,105 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
             DateDebut = DateTime.Now
         };
         var budget = new PassBudget(effectiveBudget);
-        const int MeterTimeoutSeconds = 60; // Réduit: si un compteur ne répond pas en 60s, inutile d'attendre 180s
+        const int MeterTimeoutSeconds = 60;
 
         _logger.LogInformation(
-            "=== PASS RESCUE ({Budget}s budget, {Count} compteurs, mode sequentiel) ===",
+            "=== PASS RESCUE ISOLEE ({Budget}s budget, {Count} compteurs, TCP frais par compteur) ===",
             effectiveBudget, metersToRead.Count);
 
-        // Group by IP
+        // TCP scan to identify reachable IPs (avoid wasting time on dead IPs)
         var ipGroups = metersToRead
             .Where(m => m.Equipement?.AdresseIp != null)
             .GroupBy(m => $"{m.Equipement.AdresseIp}:{(m.Equipement.Port ?? "4059")}")
             .ToList();
 
-        // Compute IP success rate from previous passes to sort rescue order
-        var ipSuccessRates = sessionReport.AllResults
-            .GroupBy(r => $"{r.Ip}:{r.Port}")
-            .Where(g => !string.IsNullOrEmpty(g.Key) && g.Key != ":")
-            .ToDictionary(
-                g => g.Key,
-                g => g.Count() > 0 ? (double)g.Count(r => r.Success) / g.Count() * 100 : 0);
-
-        // TCP scan all IPs
         var allIps = ipGroups
             .Select(g => (g.First().Equipement.AdresseIp!, g.First().Equipement.Port ?? "4059"))
-            .Distinct()
-            .ToList();
+            .Distinct().ToList();
 
         var tcpScanTimeout = TimeSpan.FromSeconds(globalConfig.TcpScanTimeoutSeconds);
         _logger.LogInformation("[Rescue] Test TCP de {Count} IPs", allIps.Count);
         var scanResults = await _tcpScanService.ParallelTcpScanAsync(allIps, tcpScanTimeout);
         var reachableIps = new HashSet<string>(scanResults.Where(r => r.Reachable).Select(r => r.Key));
-
         _logger.LogInformation("[Rescue] {Reachable}/{Total} IPs accessibles", reachableIps.Count, allIps.Count);
 
-        // Mark unreachable meters
-        foreach (var g in ipGroups.Where(g =>
-            !reachableIps.Contains($"{g.First().Equipement.AdresseIp}:{(g.First().Equipement.Port ?? "4059")}")))
-        {
-            foreach (var m in g)
-            {
-                passResult.Results.Add(new MeterReadOutcome
-                {
-                    Serial = m.Compteur?.NumeroCompteur ?? "",
-                    Ip = m.Equipement?.AdresseIp ?? "",
-                    Port = m.Equipement?.Port ?? "",
-                    CompteurEquipementId = m.Id,
-                    Error = "IP inaccessible (rescue)",
-                    ResultCategory = MeterReadingResult.EchecLecture
-                });
-            }
-        }
+        // Build flat list of meters to read, sorted by IP success rate (best first)
+        var ipSuccessRates = sessionReport.AllResults
+            .GroupBy(r => $"{r.Ip}:{r.Port}")
+            .Where(g => !string.IsNullOrEmpty(g.Key) && g.Key != ":")
+            .ToDictionary(g => g.Key,
+                g => g.Count() > 0 ? (double)g.Count(r => r.Success) / g.Count() * 100 : 0);
 
-        // Process reachable IPs sequentially — sorted by success rate (best first, dead last)
-        var sortedReachableGroups = ipGroups
-            .Where(g => reachableIps.Contains($"{g.First().Equipement.AdresseIp}:{(g.First().Equipement.Port ?? "4059")}"))
-            .OrderByDescending(g =>
+        var sortedMeters = metersToRead
+            .Where(m => m.Equipement?.AdresseIp != null)
+            .OrderByDescending(m =>
             {
-                var ipKey = $"{g.First().Equipement.AdresseIp}:{(g.First().Equipement.Port ?? "4059")}";
-                return ipSuccessRates.TryGetValue(ipKey, out var rate) ? rate : -1;
+                var ipKey = $"{m.Equipement.AdresseIp}:{(m.Equipement.Port ?? "4059")}";
+                if (!reachableIps.Contains(ipKey)) return -100; // Dead IPs last
+                return ipSuccessRates.TryGetValue(ipKey, out var rate) ? rate : 0;
             })
             .ToList();
 
-        _logger.LogInformation("[Rescue] Ordre de traitement: {Order}",
-            string.Join(", ", sortedReachableGroups.Select(g =>
-            {
-                var ipKey = $"{g.First().Equipement.AdresseIp}:{(g.First().Equipement.Port ?? "4059")}";
-                var rate = ipSuccessRates.TryGetValue(ipKey, out var r) ? r : 0;
-                return $"{ipKey}({rate:F0}%)";
-            })));
+        _logger.LogInformation("[Rescue] Ordre: IPs accessibles par taux de succes, puis IPs mortes en dernier");
 
-        foreach (var group in sortedReachableGroups)
+        int okCount = 0;
+        int failCount = 0;
+        int skipCount = 0;
+
+        // Process each meter with a FULLY ISOLATED session (fresh TCP + HDLC per meter)
+        foreach (var meter in sortedMeters)
         {
+            var serial = meter.Compteur?.NumeroCompteur ?? "";
+            var ipKey = $"{meter.Equipement?.AdresseIp}:{(meter.Equipement?.Port ?? "4059")}";
+
+            // Budget check
             if (budget.IsExpired)
             {
-                _logger.LogWarning("[Rescue] Budget expire, {Count} compteurs restants non traites",
-                    group.Count());
-                foreach (var m in group)
+                passResult.Results.Add(new MeterReadOutcome
                 {
-                    passResult.Results.Add(new MeterReadOutcome
-                    {
-                        Serial = m.Compteur?.NumeroCompteur ?? "",
-                        Ip = m.Equipement?.AdresseIp ?? "",
-                        Port = m.Equipement?.Port ?? "",
-                        CompteurEquipementId = m.Id,
-                        Error = "Budget expire (rescue)",
-                        ResultCategory = MeterReadingResult.BudgetExpire
-                    });
-                }
+                    Serial = serial, Ip = meter.Equipement?.AdresseIp ?? "",
+                    Port = meter.Equipement?.Port ?? "", CompteurEquipementId = meter.Id,
+                    Error = "Budget expire (rescue)", ResultCategory = MeterReadingResult.BudgetExpire
+                });
+                skipCount++;
                 continue;
             }
 
-            var firstMeter = group.First();
-            var ipKey = $"{firstMeter.Equipement.AdresseIp}:{(firstMeter.Equipement.Port ?? "4059")}";
-
-            // Open TCP transport
-            var transportParams = new DLMSConnectionParameters
+            // Skip TCP-dead IPs instantly
+            if (!reachableIps.Contains(ipKey))
             {
-                AddressIp = firstMeter.Equipement.AdresseIp!,
-                Port = firstMeter.Equipement.Port ?? "4059",
-                InterfaceType = "HDLC"
-            };
-
-            var session = _sessionFactory.CreateSession(transportParams);
-            using var tcpCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
-            using var tcpLinked = CancellationTokenSource.CreateLinkedTokenSource(ct, tcpCts.Token);
-
-            var tcpOk = await session.OpenTransportAsync(tcpLinked.Token);
-            if (!tcpOk)
-            {
-                _logger.LogWarning("[Rescue] TCP {IpKey} echec, {Count} compteurs non lus", ipKey, group.Count());
-                foreach (var m in group)
+                passResult.Results.Add(new MeterReadOutcome
                 {
-                    passResult.Results.Add(new MeterReadOutcome
-                    {
-                        Serial = m.Compteur?.NumeroCompteur ?? "",
-                        Ip = m.Equipement?.AdresseIp ?? "",
-                        Port = m.Equipement?.Port ?? "",
-                        CompteurEquipementId = m.Id,
-                        Error = "TCP echec (rescue)",
-                        ResultCategory = MeterReadingResult.EchecLecture
-                    });
-                }
+                    Serial = serial, Ip = meter.Equipement?.AdresseIp ?? "",
+                    Port = meter.Equipement?.Port ?? "", CompteurEquipementId = meter.Id,
+                    Error = "IP inaccessible (rescue)", ResultCategory = MeterReadingResult.IpMorte
+                });
+                skipCount++;
                 continue;
             }
 
-            _logger.LogInformation("[Rescue] {IpKey} connecte — lecture de {Count} compteurs", ipKey, group.Count());
+            // Read meter in FULLY ISOLATED mode (fresh TCP + HDLC, no retry)
+            var meterResult = await _parallelReadService.ReadMeterIsolatedAsync(meter, MeterTimeoutSeconds);
+            passResult.Results.Add(meterResult);
 
-            int okCount = 0;
-            foreach (var meter in group)
+            if (meterResult.Success)
             {
-                if (budget.IsExpired)
-                {
-                    passResult.Results.Add(new MeterReadOutcome
-                    {
-                        Serial = meter.Compteur?.NumeroCompteur ?? "",
-                        Ip = meter.Equipement?.AdresseIp ?? "",
-                        Port = meter.Equipement?.Port ?? "",
-                        CompteurEquipementId = meter.Id,
-                        Error = "Budget expire (rescue)",
-                        ResultCategory = MeterReadingResult.BudgetExpire
-                    });
-                    continue;
-                }
-
-                var serial = meter.Compteur?.NumeroCompteur ?? "";
-                MeterReadOutcome meterResult;
-                try
-                {
-                    meterResult = await _parallelReadService.ReadSingleMeterOnSessionAsync(
-                        session, meter, TimeSpan.FromSeconds(MeterTimeoutSeconds), ct);
-                }
-                catch (Exception ex)
-                {
-                    meterResult = new MeterReadOutcome
-                    {
-                        Serial = serial,
-                        Ip = meter.Equipement?.AdresseIp ?? "",
-                        Port = meter.Equipement?.Port ?? "",
-                        CompteurEquipementId = meter.Id,
-                        Error = ex.Message,
-                        ResultCategory = MeterReadingResult.EchecLecture
-                    };
-                }
-
-                passResult.Results.Add(meterResult);
-
-                if (meterResult.Success)
-                {
-                    okCount++;
-                    _logger.LogDebug("[Rescue] {Serial} OK ({TotalMs}ms)", serial, meterResult.TotalMs);
-                }
-                else
-                {
-                    _logger.LogDebug("[Rescue] {Serial} ECHEC — {Error}", serial, meterResult.Error);
-
-                    // Reconnexion TCP complète après échec pour éviter la cascade
-                    // (la session HDLC est corrompue après un timeout GetAssociationView)
-                    try { await session.DisconnectAsync(); } catch { }
-                    await Task.Delay(500, ct); // laisser le concentrateur respirer
-
-                    session = _sessionFactory.CreateSession(transportParams);
-                    using var reconnCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
-                    using var reconnLinked = CancellationTokenSource.CreateLinkedTokenSource(ct, reconnCts.Token);
-                    var reconnOk = await session.OpenTransportAsync(reconnLinked.Token);
-                    if (!reconnOk)
-                    {
-                        _logger.LogWarning("[Rescue] Reconnexion TCP {IpKey} echouee, skip {Count} compteurs restants",
-                            ipKey, group.Count() - okCount - passResult.Results.Count(r => r.Ip == firstMeter.Equipement?.AdresseIp && !r.Success));
-
-                        // Marquer les compteurs restants non encore traités
-                        foreach (var remaining in group.Where(m =>
-                            !passResult.Results.Any(r => r.Serial == (m.Compteur?.NumeroCompteur ?? ""))))
-                        {
-                            passResult.Results.Add(new MeterReadOutcome
-                            {
-                                Serial = remaining.Compteur?.NumeroCompteur ?? "",
-                                Ip = remaining.Equipement?.AdresseIp ?? "",
-                                Port = remaining.Equipement?.Port ?? "",
-                                CompteurEquipementId = remaining.Id,
-                                Error = "Reconnexion TCP echouee (rescue)",
-                                ResultCategory = MeterReadingResult.EchecLecture
-                            });
-                        }
-                        break; // Passer à l'IP suivante
-                    }
-                    _logger.LogDebug("[Rescue] Reconnexion TCP {IpKey} OK", ipKey);
-                }
-
-                // Pacing delay
-                await Task.Delay(globalConfig.PacingDelayMs, ct);
+                okCount++;
+                _logger.LogDebug("[Rescue] {Serial} OK ({TotalMs}ms)", serial, meterResult.TotalMs);
+            }
+            else
+            {
+                failCount++;
+                _logger.LogDebug("[Rescue] {Serial} ECHEC — {Error} ({TotalMs}ms)",
+                    serial, meterResult.Error, meterResult.TotalMs);
             }
 
-            // Disconnect final
-            try { await session.DisconnectAsync(); } catch { }
-
-            _logger.LogInformation("[Rescue] {IpKey} : {OK}/{Total} OK",
-                ipKey, okCount, group.Count());
+            // Pacing between meters (let concentrator breathe)
+            await Task.Delay(200, ct);
         }
+
+        _logger.LogInformation("[Rescue] Resultat: {OK} lus, {Fail} echoues, {Skip} non traites (budget/IP morte)",
+            okCount, failCount, skipCount);
 
         passResult.ElapsedMs = budget.ElapsedMs;
         passResult.DateFin = DateTime.Now;

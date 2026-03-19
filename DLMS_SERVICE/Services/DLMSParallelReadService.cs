@@ -33,6 +33,15 @@ namespace DLMS_SERVICE.Services
             CompteurEquipement meter,
             TimeSpan timeout,
             CancellationToken ct);
+
+        /// <summary>
+        /// Reads a single meter in fully isolated mode: fresh TCP + HDLC per meter,
+        /// no CancellationToken timeout (uses Gurux WaitTime), no retry.
+        /// Mimics the --seq --meter individual read behavior.
+        /// </summary>
+        Task<MultiPass.MeterReadOutcome> ReadMeterIsolatedAsync(
+            CompteurEquipement meter,
+            int timeoutSeconds);
     }
 
     public class DLMSParallelReadService : IDLMSParallelReadService
@@ -800,6 +809,136 @@ namespace DLMS_SERVICE.Services
             finally
             {
                 try { session.Reader?.Disconnect(); } catch { }
+            }
+
+            return outcome;
+        }
+
+        /// <summary>
+        /// Reads a meter in fully isolated mode — fresh TCP connection, fresh HDLC session,
+        /// no CancellationToken timeout (uses Gurux WaitTime), no retry on failure.
+        /// This mimics the behavior of --seq --meter which achieves 95% success on "difficult" meters.
+        /// </summary>
+        public async Task<MeterReadOutcome> ReadMeterIsolatedAsync(
+            CompteurEquipement meter,
+            int timeoutSeconds)
+        {
+            var serial = meter.Compteur?.NumeroCompteur ?? "";
+            var ip = meter.Equipement?.AdresseIp ?? "";
+            var port = meter.Equipement?.Port ?? "4059";
+            var outcome = new MeterReadOutcome
+            {
+                Serial = serial,
+                Ip = ip,
+                Port = port,
+                CompteurEquipementId = meter.Id,
+                TimeoutApplied = timeoutSeconds
+            };
+
+            var totalSw = System.Diagnostics.Stopwatch.StartNew();
+
+            try
+            {
+                // 1. Retrieve keys
+                var keySw = System.Diagnostics.Stopwatch.StartNew();
+                var keys = await _keyService.GetKeysAsync("read", serial, "read");
+                keySw.Stop();
+                outcome.KeysRetrievalMs = keySw.ElapsedMilliseconds;
+
+                if (keys == null || !keys.IsValid)
+                {
+                    outcome.Error = "Cles DLMS invalides ou manquantes";
+                    outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.CleManquante;
+                    return outcome;
+                }
+
+                // 2. Open fresh TCP connection (isolated per meter)
+                var transportParams = new DLMSConnectionParameters
+                {
+                    AddressIp = ip,
+                    Port = port,
+                    InterfaceType = "HDLC"
+                };
+
+                var session = _sessionFactory.CreateSession(transportParams);
+                using var tcpCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+                var tcpOk = await session.OpenTransportAsync(tcpCts.Token);
+                if (!tcpOk)
+                {
+                    outcome.Error = "TCP connexion echouee";
+                    outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.IpMorte;
+                    return outcome;
+                }
+
+                try
+                {
+                    // 3. Initialize meter client — fresh state
+                    var meterParams = new DLMSConnectionParameters
+                    {
+                        ClientAddress = "read",
+                        SerialNumber = serial,
+                        Password = keys.Password,
+                        AuthenticationKey = keys.AuthenticationKey,
+                        UnicastKey = keys.UnicastKey,
+                        InterfaceType = "HDLC"
+                    };
+
+                    // WaitTime contrôle le timeout Gurux interne (pas de CancellationToken)
+                    var waitTimeMs = timeoutSeconds * 1000;
+                    session.InitializeMeterClient(meterParams, waitTime: waitTimeMs, retryCount: 1);
+
+                    // 4. HDLC association (synchrone, Gurux gère son propre timeout)
+                    var hdlcSw = System.Diagnostics.Stopwatch.StartNew();
+                    await Task.Run(() => session.Reader!.InitializeConnection());
+                    hdlcSw.Stop();
+                    outcome.HdlcMs = hdlcSw.ElapsedMilliseconds;
+
+                    // 5. Read instant data
+                    session.ReadObjects.Clear();
+                    session.ReadObjects.AddRange(ParseObjects(
+                        "0.0.42.0.0.255:2;0.0.96.2.128.255:2;1.0.99.1.0.255:4;1.0.99.2.0.255:4;0.0.0.2.8.255:2;0.0.0.2.0.255:2;1.0.0.2.2.255:2"));
+
+                    var readSw = System.Diagnostics.Stopwatch.StartNew();
+                    var readResult = await ReadCompteurDataAsync(session, meter, default);
+                    readSw.Stop();
+                    outcome.ReadMs = readSw.ElapsedMilliseconds;
+
+                    if (!readResult.Success)
+                    {
+                        outcome.Error = readResult.ErrorMessage;
+                        outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.EchecLecture;
+                        return outcome;
+                    }
+
+                    // 6. Process instant data
+                    var dataProcessingService = _dataProcessingServiceFactory.Create();
+                    await dataProcessingService.ProcessCompteurDataAsync(readResult.Data, meter.CompteurId);
+
+                    // 7. Read profiles (sequential, incremental)
+                    var profileResults = await ReadProfilesSequentialAsync(session, serial, default);
+                    outcome.ProfileResults = profileResults;
+
+                    // Success
+                    outcome.Success = true;
+                    outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.Lu;
+                    totalSw.Stop();
+                    outcome.TotalMs = totalSw.ElapsedMilliseconds;
+
+                    _healthTracker.RecordResult(serial, totalSw.Elapsed, true);
+                }
+                finally
+                {
+                    try { session.Reader?.Disconnect(); } catch { }
+                    await session.DisconnectAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                totalSw.Stop();
+                outcome.TotalMs = totalSw.ElapsedMilliseconds;
+                outcome.Error = ex.Message;
+                outcome.ResultCategory = DLMS_MODELS.ReadingDomain.Enums.MeterReadingResult.EchecLecture;
+                _healthTracker.RecordResult(serial, totalSw.Elapsed, false);
             }
 
             return outcome;

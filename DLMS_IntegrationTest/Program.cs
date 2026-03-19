@@ -103,7 +103,7 @@ class PassConfig
     public int CooldownSeconds;
     public int PauseAfterSeconds;
 
-    public const int TcpScanTimeoutSeconds = 8;
+    public const int TcpScanTimeoutSeconds = 15;
 
     public PassConfig(int passNumber, int budget, int canary, int cached,
         int uncached, int maxFails, int cooldownCount, int cooldownSeconds, int pause)

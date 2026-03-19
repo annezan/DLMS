@@ -1001,9 +1001,10 @@ class Program
     {
         var passResult = new PassResult { PassNumber = 2 };
         var budget = new PassBudget(effectiveBudget);
-        const int MeterTimeoutSeconds = 60;
+        const int CachedTimeoutSeconds = 30;
+        const int UncachedTimeoutSeconds = 120;
 
-        Console.WriteLine($"=== PASS RESCUE ISOLEE ({effectiveBudget}s budget, {metersToRead.Count} compteurs, TCP frais par compteur) ===");
+        Console.WriteLine($"=== PASS RESCUE ISOLEE ({effectiveBudget}s budget, {metersToRead.Count} compteurs, TCP frais par compteur, cache-building) ===");
         Console.WriteLine();
 
         // TCP scan to identify reachable IPs
@@ -1022,22 +1023,32 @@ class Program
             .ToDictionary(g => g.Key,
                 g => g.Count() > 0 ? (double)g.Count(r => r.Success) / g.Count() * 100 : 0);
 
-        // Sort meters: reachable IPs with best success rate first, dead IPs last
+        // Sort: cached meters first (quick), then uncached by IP success rate, dead IPs last
         var sortedMeters = metersToRead
-            .OrderByDescending(m =>
+            .Select(m => new
             {
-                var ipKey = $"{m.Ip}:{m.Port}";
-                if (!reachableIps.Contains(ipKey)) return -100.0;
-                return ipSuccessRates.TryGetValue(ipKey, out var rate) ? rate : 0;
-            }).ToList();
+                Meter = m,
+                HasCache = File.Exists(Path.Combine("associations", $"{m.Serial}_Read.xml")),
+                IpReachable = reachableIps.Contains($"{m.Ip}:{m.Port}"),
+                IpRate = ipSuccessRates.TryGetValue($"{m.Ip}:{m.Port}", out var r) ? r : 0
+            })
+            .OrderByDescending(m => m.IpReachable ? 1 : 0)
+            .ThenByDescending(m => m.HasCache ? 1 : 0)
+            .ThenByDescending(m => m.IpRate)
+            .ToList();
 
+        var cachedCount = sortedMeters.Count(m => m.HasCache && m.IpReachable);
+        var uncachedCount = sortedMeters.Count(m => !m.HasCache && m.IpReachable);
+        Console.WriteLine($"  {cachedCount} avec cache (timeout {CachedTimeoutSeconds}s), {uncachedCount} sans cache (timeout {UncachedTimeoutSeconds}s, cache-building)");
         Console.WriteLine();
 
-        int okCount = 0, failCount = 0, skipCount = 0;
+        int okCount = 0, failCount = 0, skipCount = 0, cacheBuilt = 0;
 
-        // Read each meter with FULLY ISOLATED session (fresh TCP + HDLC per meter)
-        foreach (var meter in sortedMeters)
+        // Read each meter with FULLY ISOLATED session
+        foreach (var entry in sortedMeters)
         {
+            var meter = entry.Meter;
+
             if (budget.IsExpired)
             {
                 passResult.Results.Add(new MeterResult
@@ -1049,10 +1060,7 @@ class Program
                 continue;
             }
 
-            var ipKey = $"{meter.Ip}:{meter.Port}";
-
-            // Skip dead IPs instantly
-            if (!reachableIps.Contains(ipKey))
+            if (!entry.IpReachable)
             {
                 passResult.Results.Add(new MeterResult
                 {
@@ -1063,7 +1071,8 @@ class Program
                 continue;
             }
 
-            Console.Write($"    [Rescue] {meter.Serial} ({ipKey}) ... ");
+            var timeout = entry.HasCache ? CachedTimeoutSeconds : UncachedTimeoutSeconds;
+            Console.Write($"    [Rescue] {meter.Serial} ({meter.Ip}, {(entry.HasCache ? "cache" : "no-cache")}, {timeout}s) ... ");
 
             // Fresh TCP connection per meter
             var transportParams = new DLMSConnectionParameters
@@ -1089,16 +1098,16 @@ class Program
                 {
                     try
                     {
-                        // Read with fresh session — no retry (saves budget for other meters)
-                        meterResult = await ReadSingleMeter(session, meter, keyService, noRetry: true)
-                            .WaitAsync(TimeSpan.FromSeconds(MeterTimeoutSeconds));
+                        // Cached: noRetry (lecture rapide). Uncached: allow retry (cache-building)
+                        meterResult = await ReadSingleMeter(session, meter, keyService, noRetry: entry.HasCache)
+                            .WaitAsync(TimeSpan.FromSeconds(timeout));
                     }
                     catch (TimeoutException)
                     {
                         meterResult = new MeterResult
                         {
                             Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
-                            Error = $"Timeout ({MeterTimeoutSeconds}s)"
+                            Error = $"Timeout ({timeout}s)"
                         };
                     }
                     finally
@@ -1122,7 +1131,16 @@ class Program
             if (meterResult.Success)
             {
                 okCount++;
-                Console.WriteLine($"OK (HDLC:{meterResult.HdlcMs}ms, Lecture:{meterResult.ReadMs}ms)");
+                var cacheFile = Path.Combine("associations", $"{meter.Serial}_Read.xml");
+                if (!entry.HasCache && File.Exists(cacheFile))
+                {
+                    cacheBuilt++;
+                    Console.WriteLine($"OK + CACHE CONSTITUE (HDLC:{meterResult.HdlcMs}ms, Lecture:{meterResult.ReadMs}ms)");
+                }
+                else
+                {
+                    Console.WriteLine($"OK (HDLC:{meterResult.HdlcMs}ms, Lecture:{meterResult.ReadMs}ms){(entry.HasCache ? " [cache]" : "")}");
+                }
             }
             else
             {
@@ -1134,7 +1152,7 @@ class Program
         }
 
         Console.WriteLine();
-        Console.WriteLine($"  [Rescue] Resultat: {okCount} lus, {failCount} echoues, {skipCount} non traites");
+        Console.WriteLine($"  [Rescue] Resultat: {okCount} lus, {failCount} echoues, {skipCount} non traites, {cacheBuilt} caches constitues");
 
         passResult.ElapsedMs = budget.ElapsedMs;
         return passResult;

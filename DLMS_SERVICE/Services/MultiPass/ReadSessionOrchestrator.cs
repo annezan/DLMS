@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO;
 using DLMS_MODELS;
 using DLMS_MODELS.CompteurEquipementDomain.Entities;
 using DLMS_MODELS.ReadingDomain.Enums;
@@ -594,10 +595,11 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
             DateDebut = DateTime.Now
         };
         var budget = new PassBudget(effectiveBudget);
-        const int MeterTimeoutSeconds = 60;
+        const int CachedTimeoutSeconds = 30;    // Compteur avec cache: lecture rapide
+        const int UncachedTimeoutSeconds = 120;  // Compteur sans cache: investir du temps pour constituer le cache
 
         _logger.LogInformation(
-            "=== PASS RESCUE ISOLEE ({Budget}s budget, {Count} compteurs, TCP frais par compteur) ===",
+            "=== PASS RESCUE ISOLEE ({Budget}s budget, {Count} compteurs, TCP frais par compteur, cache-building) ===",
             effectiveBudget, metersToRead.Count);
 
         // TCP scan to identify reachable IPs (avoid wasting time on dead IPs)
@@ -616,7 +618,7 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
         var reachableIps = new HashSet<string>(scanResults.Where(r => r.Reachable).Select(r => r.Key));
         _logger.LogInformation("[Rescue] {Reachable}/{Total} IPs accessibles", reachableIps.Count, allIps.Count);
 
-        // Build flat list of meters to read, sorted by IP success rate (best first)
+        // Build flat list: cached meters first (quick reads), uncached after (cache-building)
         var ipSuccessRates = sessionReport.AllResults
             .GroupBy(r => $"{r.Ip}:{r.Port}")
             .Where(g => !string.IsNullOrEmpty(g.Key) && g.Key != ":")
@@ -625,25 +627,36 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
 
         var sortedMeters = metersToRead
             .Where(m => m.Equipement?.AdresseIp != null)
-            .OrderByDescending(m =>
+            .Select(m => new
             {
-                var ipKey = $"{m.Equipement.AdresseIp}:{(m.Equipement.Port ?? "4059")}";
-                if (!reachableIps.Contains(ipKey)) return -100; // Dead IPs last
-                return ipSuccessRates.TryGetValue(ipKey, out var rate) ? rate : 0;
+                Meter = m,
+                Serial = m.Compteur?.NumeroCompteur ?? "",
+                IpKey = $"{m.Equipement.AdresseIp}:{(m.Equipement.Port ?? "4059")}",
+                HasCache = File.Exists(Path.Combine("associations", $"{m.Compteur?.NumeroCompteur}_Read.xml")),
+                IpReachable = reachableIps.Contains($"{m.Equipement.AdresseIp}:{(m.Equipement.Port ?? "4059")}")
             })
+            .OrderByDescending(m => m.IpReachable ? 1 : 0)      // Reachable first
+            .ThenByDescending(m => m.HasCache ? 1 : 0)            // Cached first (quick reads)
+            .ThenByDescending(m => ipSuccessRates.TryGetValue(m.IpKey, out var r) ? r : 0) // Best IPs first
             .ToList();
 
-        _logger.LogInformation("[Rescue] Ordre: IPs accessibles par taux de succes, puis IPs mortes en dernier");
+        var cachedCount = sortedMeters.Count(m => m.HasCache && m.IpReachable);
+        var uncachedCount = sortedMeters.Count(m => !m.HasCache && m.IpReachable);
+        var deadCount = sortedMeters.Count(m => !m.IpReachable);
+        _logger.LogInformation(
+            "[Rescue] {Cached} avec cache (timeout {CachedT}s), {Uncached} sans cache (timeout {UncachedT}s, cache-building), {Dead} IP mortes",
+            cachedCount, CachedTimeoutSeconds, uncachedCount, UncachedTimeoutSeconds, deadCount);
 
         int okCount = 0;
         int failCount = 0;
         int skipCount = 0;
+        int cacheBuilt = 0;
 
         // Process each meter with a FULLY ISOLATED session (fresh TCP + HDLC per meter)
-        foreach (var meter in sortedMeters)
+        foreach (var entry in sortedMeters)
         {
-            var serial = meter.Compteur?.NumeroCompteur ?? "";
-            var ipKey = $"{meter.Equipement?.AdresseIp}:{(meter.Equipement?.Port ?? "4059")}";
+            var meter = entry.Meter;
+            var serial = entry.Serial;
 
             // Budget check
             if (budget.IsExpired)
@@ -659,7 +672,7 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
             }
 
             // Skip TCP-dead IPs instantly
-            if (!reachableIps.Contains(ipKey))
+            if (!entry.IpReachable)
             {
                 passResult.Results.Add(new MeterReadOutcome
                 {
@@ -671,28 +684,44 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
                 continue;
             }
 
-            // Read meter in FULLY ISOLATED mode (fresh TCP + HDLC, no retry)
-            var meterResult = await _parallelReadService.ReadMeterIsolatedAsync(meter, MeterTimeoutSeconds);
+            // Timeout adaptatif: court si cache existe, long sinon (investissement cache-building)
+            var timeout = entry.HasCache ? CachedTimeoutSeconds : UncachedTimeoutSeconds;
+
+            // Read meter in FULLY ISOLATED mode
+            var meterResult = await _parallelReadService.ReadMeterIsolatedAsync(meter, timeout);
             passResult.Results.Add(meterResult);
 
             if (meterResult.Success)
             {
                 okCount++;
-                _logger.LogDebug("[Rescue] {Serial} OK ({TotalMs}ms)", serial, meterResult.TotalMs);
+                // Vérifier si un cache a été constitué (nouveau fichier créé)
+                var cacheFile = Path.Combine("associations", $"{serial}_Read.xml");
+                if (!entry.HasCache && File.Exists(cacheFile))
+                {
+                    cacheBuilt++;
+                    _logger.LogInformation("[Rescue] {Serial} OK + CACHE CONSTITUE ({TotalMs}ms) — les prochaines lectures seront rapides",
+                        serial, meterResult.TotalMs);
+                }
+                else
+                {
+                    _logger.LogDebug("[Rescue] {Serial} OK ({TotalMs}ms){CacheTag}",
+                        serial, meterResult.TotalMs, entry.HasCache ? " [cache]" : "");
+                }
             }
             else
             {
                 failCount++;
-                _logger.LogDebug("[Rescue] {Serial} ECHEC — {Error} ({TotalMs}ms)",
-                    serial, meterResult.Error, meterResult.TotalMs);
+                _logger.LogDebug("[Rescue] {Serial} ECHEC — {Error} ({TotalMs}ms, timeout={Timeout}s{CacheTag})",
+                    serial, meterResult.Error, meterResult.TotalMs, timeout, entry.HasCache ? ", cache" : ", no-cache");
             }
 
             // Pacing between meters (let concentrator breathe)
             await Task.Delay(200, ct);
         }
 
-        _logger.LogInformation("[Rescue] Resultat: {OK} lus, {Fail} echoues, {Skip} non traites (budget/IP morte)",
-            okCount, failCount, skipCount);
+        _logger.LogInformation(
+            "[Rescue] Resultat: {OK} lus, {Fail} echoues, {Skip} non traites, {CacheBuilt} caches constitues",
+            okCount, failCount, skipCount, cacheBuilt);
 
         passResult.ElapsedMs = budget.ElapsedMs;
         passResult.DateFin = DateTime.Now;

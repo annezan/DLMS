@@ -567,7 +567,8 @@ class Program
     private static async Task<MeterResult> ReadSingleMeter(
         IDLMSCommunicationSession session,
         MeterInfo meter,
-        DLMSKeyService keyService)
+        DLMSKeyService keyService,
+        bool noRetry = false)
     {
         var result = new MeterResult
         {
@@ -628,8 +629,14 @@ class Program
 
             if (readResult == "Lecture impossible")
             {
+                if (noRetry)
+                {
+                    result.Error = "Lecture impossible";
+                    return result;
+                }
+
                 // Retry: disconnect HDLC, re-associate, re-read
-                Console.WriteLine($"    [{meter.Ip}] {meter.Serial} retry apres echec lecture");
+                Console.Write($"retry... ");
                 try { session.Reader?.Disconnect(); } catch { }
 
                 session.AssociationLoaded = false;
@@ -666,7 +673,7 @@ class Program
         return result;
     }
 
-    // ===== RunSequentialTest =====
+    // ===== RunSequentialTest (mode isolé: TCP frais par compteur) =====
 
     private static async Task<TestReport> RunSequentialTest(
         List<MeterInfo> meters, DbContextOptions<DLMSDBContext> dbOptions,
@@ -674,14 +681,14 @@ class Program
     {
         var report = new TestReport
         {
-            Mode = "Sequentiel",
+            Mode = "Sequentiel isole (TCP frais par compteur)",
             DbLoadMs = dbLoadMs,
             TotalMeters = totalMeters,
             TotalIps = totalIps,
             MetersWithKeys = meters.Count
         };
 
-        Console.WriteLine("=== Mode SEQUENTIEL ===");
+        Console.WriteLine("=== Mode SEQUENTIEL ISOLE (TCP frais par compteur) ===");
         Console.WriteLine();
 
         var contextFactory = new SimpleDbContextFactory(dbOptions);
@@ -693,7 +700,7 @@ class Program
         var sessionLogger = _loggerFactory.CreateLogger<DLMSGuruxSession>();
         var sessionFactory = new DLMSGuruxSessionFactory(factoryLogger, sessionLogger);
 
-        // Group meters by IP
+        // Group meters by IP for TCP pre-scan
         var ipGroups = meters.GroupBy(m => $"{m.Ip}:{m.Port}").OrderBy(g => g.Key).ToList();
 
         // Phase 1: Parallel TCP pre-scan (5s timeout) to identify reachable IPs
@@ -739,8 +746,8 @@ class Program
         Console.WriteLine($"  Resultats: {reachableIps.Count}/{ipGroups.Count} IPs accessibles");
         Console.WriteLine();
 
-        // Phase 2: Sequential reads only on reachable IPs
-        Console.WriteLine("[Lectures] Traitement des IPs accessibles...");
+        // Phase 2: Read each meter with its own fresh TCP connection (isolated)
+        Console.WriteLine("[Lectures] Mode isole — TCP frais par compteur...");
         Console.WriteLine();
 
         foreach (var group in ipGroups)
@@ -753,88 +760,94 @@ class Program
                 Port = firstMeter.Port
             };
 
-            // Skip unreachable IPs (already detected by pre-scan)
+            // Skip unreachable IPs
             if (!reachableIps.Contains(ipKey))
             {
                 ipResult.TcpError = "Echec au pre-scan TCP";
-                Console.WriteLine($"--- TCP {ipKey} ... IGNORE (echec pre-scan)");
+                Console.WriteLine($"--- {ipKey} IGNORE (echec pre-scan)");
                 report.IpGroups.Add(ipResult);
                 continue;
             }
 
-            Console.Write($"--- TCP {firstMeter.Ip}:{firstMeter.Port} ... ");
+            Console.WriteLine($"--- {ipKey} ({group.Count()} compteurs)");
 
-            // Open TCP connection (5s timeout for batch mode)
-            var transportParams = new DLMSConnectionParameters
+            foreach (var meter in group)
             {
-                AddressIp = firstMeter.Ip,
-                Port = firstMeter.Port,
-                Trace = TraceLevel.Off
-            };
+                Console.Write($"  {meter.Serial} ... ");
 
-            var session = sessionFactory.CreateSession(transportParams);
-
-            var tcpSw = Stopwatch.StartNew();
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            var connected = await session.OpenTransportAsync(cts.Token);
-            tcpSw.Stop();
-            ipResult.TcpMs = tcpSw.ElapsedMilliseconds;
-
-            if (!connected)
-            {
-                ipResult.TcpError = "Timeout TCP";
-                Console.WriteLine($"ECHEC ({tcpSw.ElapsedMilliseconds}ms)");
-                report.IpGroups.Add(ipResult);
-                continue;
-            }
-
-            ipResult.TcpSuccess = true;
-            Console.WriteLine($"OK ({tcpSw.ElapsedMilliseconds}ms)");
-
-            try
-            {
-                // Read each meter on this IP sequentially (180s global timeout per meter)
-                foreach (var meter in group)
+                // Fresh TCP connection per meter
+                var transportParams = new DLMSConnectionParameters
                 {
-                    Console.Write($"  Compteur {meter.Serial} ... ");
+                    AddressIp = meter.Ip,
+                    Port = meter.Port,
+                    Trace = TraceLevel.Off
+                };
 
-                    MeterResult meterResult;
-                    try
-                    {
-                        meterResult = await ReadSingleMeter(session, meter, keyService)
-                            .WaitAsync(TimeSpan.FromSeconds(180));
-                    }
-                    catch (TimeoutException)
+                var session = sessionFactory.CreateSession(transportParams);
+                MeterResult meterResult;
+
+                try
+                {
+                    using var tcpCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+                    var connected = await session.OpenTransportAsync(tcpCts.Token);
+
+                    if (!connected)
                     {
                         meterResult = new MeterResult
                         {
                             Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
-                            Error = "Timeout global (180s)"
+                            Error = "TCP echec"
                         };
-                        try { session.Reader?.Disconnect(); } catch { }
-                    }
-                    ipResult.MeterResults.Add(meterResult);
-
-                    if (meterResult.Success)
-                    {
-                        Console.WriteLine($"OK (HDLC:{meterResult.HdlcMs}ms, Lecture:{meterResult.ReadMs}ms)");
                     }
                     else
                     {
-                        Console.WriteLine($"ECHEC - {meterResult.Error}");
+                        try
+                        {
+                            meterResult = await ReadSingleMeter(session, meter, keyService, noRetry: false)
+                                .WaitAsync(TimeSpan.FromSeconds(120));
+                        }
+                        catch (TimeoutException)
+                        {
+                            meterResult = new MeterResult
+                            {
+                                Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
+                                Error = "Timeout (120s)"
+                            };
+                        }
+                        finally
+                        {
+                            try { session.Reader?.Disconnect(); } catch { }
+                            try { await session.DisconnectAsync(); } catch { }
+                        }
                     }
-
-                    // 100ms pacing delay between meters
-                    await Task.Delay(100);
                 }
+                catch (Exception ex)
+                {
+                    meterResult = new MeterResult
+                    {
+                        Serial = meter.Serial, Ip = meter.Ip, Port = meter.Port,
+                        Error = ex.Message
+                    };
+                }
+
+                ipResult.MeterResults.Add(meterResult);
+
+                if (meterResult.Success)
+                {
+                    Console.WriteLine($"OK (HDLC:{meterResult.HdlcMs}ms, Lecture:{meterResult.ReadMs}ms)");
+                }
+                else
+                {
+                    Console.WriteLine($"ECHEC - {meterResult.Error}");
+                }
+
+                await Task.Delay(200); // pacing
             }
-            finally
-            {
-                await session.DisconnectAsync();
-            }
+
+            Console.WriteLine($"  => {ipKey} : {ipResult.MeterResults.Count(r => r.Success)}/{group.Count()} OK");
+            Console.WriteLine();
 
             report.IpGroups.Add(ipResult);
-            Console.WriteLine();
         }
 
         return report;
@@ -1076,8 +1089,8 @@ class Program
                 {
                     try
                     {
-                        // Read with fresh session — identical to --seq --meter behavior
-                        meterResult = await ReadSingleMeter(session, meter, keyService)
+                        // Read with fresh session — no retry (saves budget for other meters)
+                        meterResult = await ReadSingleMeter(session, meter, keyService, noRetry: true)
                             .WaitAsync(TimeSpan.FromSeconds(MeterTimeoutSeconds));
                     }
                     catch (TimeoutException)

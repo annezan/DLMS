@@ -181,11 +181,28 @@ namespace DLMS_SERVICE
             Log.Information("Environnement: {Environment}, Serveur: {Serveur}, Database: {Database}", 
                 env, serveur, db);
 
-            var ascuser = new asc_connection.connection();
-            var user = ascuser.asc_user;
-            var pass = ascuser.asc_pass;
-            Log.Information("Credentials récupérés depuis asc_connection");
-              
+            // Priorité 1 : credentials depuis appsettings.json
+            var user = configuration.GetSection("DbUser").Value;
+            var pass = configuration.GetSection("DbPassword").Value;
+
+            // Priorité 2 : fallback sur asc_connection.dll
+            if (string.IsNullOrEmpty(user) || string.IsNullOrEmpty(pass))
+            {
+                var ascuser = new asc_connection.connection();
+                user = ascuser.asc_user;
+                pass = ascuser.asc_pass;
+                Log.Information("Credentials récupérés depuis asc_connection");
+            }
+            else
+            {
+                Log.Information("Credentials récupérés depuis appsettings.json");
+            }
+
+            if (string.IsNullOrEmpty(user) || string.IsNullOrEmpty(pass))
+            {
+                throw new InvalidOperationException("Credentials de base de données manquants: configurer DbUser/DbPassword dans appsettings.json ou vérifier asc_connection.dll");
+            }
+
             if (string.IsNullOrEmpty(serveur) || string.IsNullOrEmpty(db))
             {
                 throw new InvalidOperationException("Configuration de base de données incomplète: Serveur ou DB manquant");

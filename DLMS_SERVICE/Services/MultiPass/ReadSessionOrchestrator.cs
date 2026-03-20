@@ -370,58 +370,80 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
 
                 try
                 {
-                    // --- Canary test ---
-                    var canaryMeter = meterList[0];
-                    var canaryTimeout = budget.ClampTimeout(passConfig.CanaryTimeoutSeconds);
-                    if (canaryTimeout == -1)
-                    {
-                        foreach (var m in meterList) passResult.DeferMeter(m);
-                        passResult.DeferIp(ipKey);
-                        return;
-                    }
+                    // --- Canary test rotatif (jusqu'à 3 tentatives) ---
+                    var maxCanaryAttempts = Math.Min(3, meterList.Count);
+                    MeterReadOutcome? successfulCanary = null;
+                    int canaryIndex = -1;
+                    long canaryLatencyMs = 0;
 
-                    _logger.LogDebug("[{IpKey}] Canary {Serial} (timeout:{Timeout}s)",
-                        ipKey, canaryMeter.Compteur?.NumeroCompteur, canaryTimeout);
-
-                    var canarySw = Stopwatch.StartNew();
-                    MeterReadOutcome canaryResult;
-                    try
+                    for (int c = 0; c < maxCanaryAttempts; c++)
                     {
-                        canaryResult = await _parallelReadService.ReadSingleMeterOnSessionAsync(
-                            session, canaryMeter, TimeSpan.FromSeconds(canaryTimeout), ct);
-                    }
-                    catch (Exception ex)
-                    {
-                        canaryResult = new MeterReadOutcome
+                        var canaryMeter = meterList[c];
+                        var canaryTimeout = budget.ClampTimeout(passConfig.CanaryTimeoutSeconds);
+                        if (canaryTimeout == -1)
                         {
-                            Serial = canaryMeter.Compteur?.NumeroCompteur ?? "",
-                            Ip = canaryMeter.Equipement?.AdresseIp ?? "",
-                            Port = canaryMeter.Equipement?.Port ?? "",
-                            CompteurEquipementId = canaryMeter.Id,
-                            Error = $"Canary exception: {ex.Message}",
-                            ResultCategory = MeterReadingResult.EchecLecture
-                        };
+                            foreach (var m in meterList) passResult.DeferMeter(m);
+                            passResult.DeferIp(ipKey);
+                            return;
+                        }
+
+                        _logger.LogDebug("[{IpKey}] Canary {Serial} (timeout:{Timeout}s){Attempt}",
+                            ipKey, canaryMeter.Compteur?.NumeroCompteur, canaryTimeout,
+                            c > 0 ? $" [tentative {c + 1}/{maxCanaryAttempts}]" : "");
+
+                        var canarySw = Stopwatch.StartNew();
+                        MeterReadOutcome canaryResult;
+                        try
+                        {
+                            canaryResult = await _parallelReadService.ReadSingleMeterOnSessionAsync(
+                                session, canaryMeter, TimeSpan.FromSeconds(canaryTimeout), ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            canaryResult = new MeterReadOutcome
+                            {
+                                Serial = canaryMeter.Compteur?.NumeroCompteur ?? "",
+                                Ip = canaryMeter.Equipement?.AdresseIp ?? "",
+                                Port = canaryMeter.Equipement?.Port ?? "",
+                                CompteurEquipementId = canaryMeter.Id,
+                                Error = $"Canary exception: {ex.Message}",
+                                ResultCategory = MeterReadingResult.EchecLecture
+                            };
+                        }
+                        canarySw.Stop();
+
+                        passResult.Results.Add(canaryResult);
+                        concentratorStats.Record(ipKey, canaryResult.Success, canaryResult.TotalMs);
+
+                        if (canaryResult.Success)
+                        {
+                            successfulCanary = canaryResult;
+                            canaryIndex = c;
+                            canaryLatencyMs = canarySw.ElapsedMilliseconds;
+                            break;
+                        }
+
+                        _logger.LogDebug("[{IpKey}] Canary {Serial} ECHEC — {Error}",
+                            ipKey, canaryMeter.Compteur?.NumeroCompteur, canaryResult.Error);
                     }
-                    canarySw.Stop();
 
-                    passResult.Results.Add(canaryResult);
-                    concentratorStats.Record(ipKey, canaryResult.Success, canaryResult.TotalMs);
-
-                    if (!canaryResult.Success)
+                    // Tous les canary ont échoué
+                    if (successfulCanary == null)
                     {
+                        var remainingStart = maxCanaryAttempts;
                         if (passConfig.PassNumber < 3)
                         {
-                            _logger.LogDebug("[{IpKey}] Canary ECHEC — {Count} compteurs differes",
-                                ipKey, meterList.Count - 1);
-                            for (int i = 1; i < meterList.Count; i++)
+                            _logger.LogDebug("[{IpKey}] Canary ECHEC ({Attempts} tentatives) — {Count} compteurs differes",
+                                ipKey, maxCanaryAttempts, meterList.Count - remainingStart);
+                            for (int i = remainingStart; i < meterList.Count; i++)
                                 passResult.DeferMeter(meterList[i]);
                             passResult.DeferIp(ipKey);
                         }
                         else
                         {
-                            _logger.LogDebug("[{IpKey}] Canary ECHEC Pass 3 — abandon definitif",
-                                ipKey);
-                            for (int i = 1; i < meterList.Count; i++)
+                            _logger.LogDebug("[{IpKey}] Canary ECHEC Pass 3 ({Attempts} tentatives) — abandon definitif",
+                                ipKey, maxCanaryAttempts);
+                            for (int i = remainingStart; i < meterList.Count; i++)
                             {
                                 passResult.Results.Add(new MeterReadOutcome
                                 {
@@ -437,15 +459,16 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
                         return;
                     }
 
-                    var canaryLatencyMs = canarySw.ElapsedMilliseconds;
+                    // Canary réussi — continuer avec les compteurs restants (après les canary testés)
+                    var readStartIndex = canaryIndex + 1;
                     _logger.LogDebug("[{IpKey}] Canary OK ({LatencyMs}ms) — lecture de {Count} compteurs restants",
-                        ipKey, canaryLatencyMs, meterList.Count - 1);
+                        ipKey, canaryLatencyMs, meterList.Count - readStartIndex);
 
                     // --- Read remaining meters ---
                     int consecutiveFailures = 0;
                     int cooldownsUsed = 0;
 
-                    for (int i = 1; i < meterList.Count; i++)
+                    for (int i = readStartIndex; i < meterList.Count; i++)
                     {
                         var meter = meterList[i];
 
@@ -591,7 +614,7 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
     {
         var passResult = new PassResult
         {
-            PassNumber = passConfig.PassNumber,
+            PassNumber = 2, // Rescue = passe 2 (après Pass 1 parallèle)
             DateDebut = DateTime.Now
         };
         var budget = new PassBudget(effectiveBudget);

@@ -13,8 +13,8 @@ namespace DLMS_SERVICE.Services
     {
         private readonly ILogger<HourlyReadsWorker> _logger;
         private readonly IServiceProvider _serviceProvider;
-        private readonly TimeSpan _checkInterval = TimeSpan.FromMinutes(1);
         private readonly IIPWorkerService _workerService;
+        private readonly TimeSpan _minRestDelay = TimeSpan.FromMinutes(10);
         private volatile bool _sessionInProgress;
 
         public HourlyReadsWorker(
@@ -30,17 +30,16 @@ namespace DLMS_SERVICE.Services
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             _logger.LogInformation("=== Demarrage du HourlyReadsWorker (Multi-Pass) ===");
+            _logger.LogInformation("Premiere session immediate, puis a chaque heure pleine (repos min {Rest} en cas de debordement)",
+                _minRestDelay);
 
             while (!stoppingToken.IsCancellationRequested)
             {
+                var sessionStart = DateTime.Now;
+
                 try
                 {
-                    var now = DateTime.Now;
-
-                    if (now.Minute == 31)
-                    {
-                        await RunMultiPassSessionAsync(stoppingToken);
-                    }
+                    await RunMultiPassSessionAsync(stoppingToken);
                 }
                 catch (Exception ex)
                 {
@@ -49,7 +48,10 @@ namespace DLMS_SERVICE.Services
 
                 try
                 {
-                    await Task.Delay(_checkInterval, stoppingToken);
+                    var delay = ComputeDelayUntilNextSession(sessionStart);
+                    _logger.LogInformation("Prochaine session a {NextTime:HH:mm} (dans {Delay})",
+                        DateTime.Now.Add(delay), delay);
+                    await Task.Delay(delay, stoppingToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -59,6 +61,27 @@ namespace DLMS_SERVICE.Services
             }
 
             _logger.LogInformation("=== Arret du HourlyReadsWorker ===");
+        }
+
+        private TimeSpan ComputeDelayUntilNextSession(DateTime sessionStart)
+        {
+            // Prochain créneau = heure pleine suivant le début de la session
+            var nextSlot = new DateTime(sessionStart.Year, sessionStart.Month, sessionStart.Day,
+                sessionStart.Hour, 0, 0).AddHours(1);
+
+            var now = DateTime.Now;
+            var timeUntilSlot = nextSlot - now;
+
+            if (timeUntilSlot > TimeSpan.Zero)
+            {
+                // Session finie avant le prochain créneau → attendre le créneau
+                return timeUntilSlot;
+            }
+            else
+            {
+                // Débordement → repos minimum de 10 min
+                return _minRestDelay;
+            }
         }
 
         private async Task RunMultiPassSessionAsync(CancellationToken ct)

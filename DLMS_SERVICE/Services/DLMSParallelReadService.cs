@@ -776,8 +776,9 @@ namespace DLMS_SERVICE.Services
                 var dataProcessingService = _dataProcessingServiceFactory.Create();
                 await dataProcessingService.ProcessCompteurDataAsync(readResult.Data, meter.CompteurId);
 
-                // 6. Read profiles — sequential, prioritized, incremental
-                var profileResults = await ReadProfilesSequentialAsync(session, serial, combinedCts.Token);
+                // 6. Read profiles — sequential, prioritized, incremental, budget-aware
+                var budgetLeft = (int)(timeout.TotalSeconds - totalSw.Elapsed.TotalSeconds);
+                var profileResults = await ReadProfilesSequentialAsync(session, serial, combinedCts.Token, budgetLeft);
                 outcome.ProfileResults = profileResults;
 
                 // Success
@@ -914,8 +915,9 @@ namespace DLMS_SERVICE.Services
                     var dataProcessingService = _dataProcessingServiceFactory.Create();
                     await dataProcessingService.ProcessCompteurDataAsync(readResult.Data, meter.CompteurId);
 
-                    // 7. Read profiles (sequential, incremental)
-                    var profileResults = await ReadProfilesSequentialAsync(session, serial, default);
+                    // 7. Read profiles (sequential, incremental, budget-aware)
+                    var budgetLeft = timeoutSeconds - (int)totalSw.Elapsed.TotalSeconds;
+                    var profileResults = await ReadProfilesSequentialAsync(session, serial, default, budgetLeft);
                     outcome.ProfileResults = profileResults;
 
                     // Success
@@ -1213,11 +1215,25 @@ namespace DLMS_SERVICE.Services
         private async Task<List<ProfileReadResult>> ReadProfilesSequentialAsync(
             IDLMSCommunicationSession session,
             string serial,
-            CancellationToken ct)
+            CancellationToken ct,
+            int budgetSecondsLeft = 0)
         {
             var results = new List<ProfileReadResult>();
             var profiles = await _profileConfig.GetOrderedProfilesAsync();
             var now = DateTime.Now;
+            var profileSw = System.Diagnostics.Stopwatch.StartNew();
+
+            // Budget-awareness : si le budget est serré, ne lire que les profils essentiels (priorité 1-3)
+            // Priorité 1-3 = profils de charge (24h, 1h, 5min), Priorité 4+ = event logs
+            const int EssentialMaxPriority = 3;
+            bool budgetTight = budgetSecondsLeft > 0 && budgetSecondsLeft < 180;
+
+            if (budgetTight)
+            {
+                profiles = profiles.Where(p => p.Priority <= EssentialMaxPriority).ToList();
+                _logger.LogDebug("Budget serre ({BudgetLeft}s) pour {Serial} — lecture profils essentiels uniquement ({Count} profils)",
+                    budgetSecondsLeft, serial, profiles.Count);
+            }
 
             // Load all history for this meter in one query
             List<MeterProfileReadHistory> histories;
@@ -1230,6 +1246,19 @@ namespace DLMS_SERVICE.Services
             foreach (var profile in profiles)
             {
                 if (ct.IsCancellationRequested) break;
+
+                // Vérifier le budget restant en cours de lecture
+                if (budgetSecondsLeft > 0)
+                {
+                    var elapsed = (int)profileSw.Elapsed.TotalSeconds;
+                    var remaining = budgetSecondsLeft - elapsed;
+                    if (remaining < 15)
+                    {
+                        _logger.LogDebug("Budget profils epuise pour {Serial} apres {Elapsed}s — skip des profils restants",
+                            serial, elapsed);
+                        break;
+                    }
+                }
 
                 var profileResult = new ProfileReadResult { ProfileObis = profile.ProfileObis };
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -1426,18 +1455,16 @@ namespace DLMS_SERVICE.Services
             
             return result;
         }
-        private async Task<ReadResult> 
+        private async Task<ReadResult>
             ReadCompteurDataAsync(IDLMSCommunicationSession session, CompteurEquipement compteurEquipement, CancellationToken ct = default)
         {
-            // 🔴 PAS DE TIMEOUT INDIVIDUEL - utilise le timeout global passé
             try
             {
                 var reader = new NonStaticReaderCommunication();
-                
-                // Utiliser Task.Run avec le timeout global pour éviter les blocages infinis
-                var readTask = Task.Run(() => reader.ReadAsync(session), ct);
-                
-                // Attendre la lecture avec le timeout global
+
+                // ReadListAsync = batch DLMS (1 seul aller-retour réseau au lieu de N)
+                var readTask = Task.Run(() => reader.ReadListAsync(session), ct);
+
                 var result = await readTask;
 
                 return new ReadResult

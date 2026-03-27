@@ -31,6 +31,7 @@ namespace DLMS_COMMUNICATION.Reader
         string? OutputFile { get; }
         bool IsConnected { get; }
         bool AssociationLoaded { get; set; }
+        bool ScalersLoaded { get; set; }
 
         // Collections pour les lectures (évite les static)
         List<KeyValuePair<string, int>> ReadObjects { get; }

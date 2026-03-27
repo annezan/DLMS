@@ -29,6 +29,7 @@ namespace DLMS_SERVICE.Services
         public TraceLevel Trace { get; set; }
         public string? InvocationCounter { get; set; }
         public bool AssociationLoaded { get; set; } = false;
+        public bool ScalersLoaded { get; set; } = false;
 
         private readonly ILogger<DLMSGuruxSession> _logger;
         private bool _disposed = false;

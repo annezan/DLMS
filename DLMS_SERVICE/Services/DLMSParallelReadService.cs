@@ -718,7 +718,8 @@ namespace DLMS_SERVICE.Services
                     Password = keys.Password,
                     AuthenticationKey = keys.AuthenticationKey,
                     UnicastKey = keys.UnicastKey,
-                    InterfaceType = "HDLC"
+                    InterfaceType = "HDLC",
+                    UseGbt = true
                 };
 
                 // 3. HDLC association with timeout
@@ -763,6 +764,29 @@ namespace DLMS_SERVICE.Services
                 readSw.Stop();
                 outcome.ReadMs = readSw.ElapsedMilliseconds;
 
+                if (!readResult.Success && !outcome.Error?.Contains("Cles DLMS") == true)
+                {
+                    // Retry : reconnexion HDLC + re-lecture
+                    _logger.LogInformation("Retry lecture {Serial} apres echec: {Error}", serial, readResult.ErrorMessage);
+                    try
+                    {
+                        session.Reader?.Disconnect();
+                        session.AssociationLoaded = false;
+                        session.InitializeMeterClient(meterParams, waitTime: 5000, retryCount: 2);
+                        await Task.Run(() => session.Reader!.InitializeConnection(), combinedCts.Token);
+
+                        readSw = System.Diagnostics.Stopwatch.StartNew();
+                        readResult = await ReadCompteurDataAsync(session, meter, combinedCts.Token);
+                        readSw.Stop();
+                        outcome.ReadMs += readSw.ElapsedMilliseconds;
+                        _logger.LogInformation("Retry lecture {Serial}: {Result}", serial, readResult.Success ? "OK" : readResult.ErrorMessage);
+                    }
+                    catch (Exception retryEx)
+                    {
+                        _logger.LogWarning(retryEx, "Retry echoue pour {Serial}", serial);
+                    }
+                }
+
                 if (!readResult.Success)
                 {
                     outcome.Error = readResult.ErrorMessage;
@@ -774,11 +798,16 @@ namespace DLMS_SERVICE.Services
 
                 // 5. Process data
                 var dataProcessingService = _dataProcessingServiceFactory.Create();
-                await dataProcessingService.ProcessCompteurDataAsync(readResult.Data, meter.CompteurId);
+                var processOk = await dataProcessingService.ProcessCompteurDataAsync(readResult.Data, meter.CompteurId);
+                if (!processOk)
+                {
+                    _logger.LogWarning("Persistance echouee pour {Serial} (CompteurId={CompteurId})",
+                        serial, meter.CompteurId);
+                }
 
                 // 6. Read profiles — sequential, prioritized, incremental, budget-aware
                 var budgetLeft = (int)(timeout.TotalSeconds - totalSw.Elapsed.TotalSeconds);
-                var profileResults = await ReadProfilesSequentialAsync(session, serial, combinedCts.Token, budgetLeft);
+                var profileResults = await ReadProfilesSequentialAsync(session, serial, combinedCts.Token, budgetLeft, meterParams);
                 outcome.ProfileResults = profileResults;
 
                 // Success
@@ -881,7 +910,8 @@ namespace DLMS_SERVICE.Services
                         Password = keys.Password,
                         AuthenticationKey = keys.AuthenticationKey,
                         UnicastKey = keys.UnicastKey,
-                        InterfaceType = "HDLC"
+                        InterfaceType = "HDLC",
+                        UseGbt = true
                     };
 
                     // WaitTime contrôle le timeout Gurux interne (pas de CancellationToken)
@@ -904,6 +934,29 @@ namespace DLMS_SERVICE.Services
                     readSw.Stop();
                     outcome.ReadMs = readSw.ElapsedMilliseconds;
 
+                    if (!readResult.Success && outcome.Error?.Contains("Cles DLMS") != true)
+                    {
+                        // Retry : reconnexion HDLC + re-lecture
+                        _logger.LogInformation("Retry lecture isolee {Serial} apres echec: {Error}", serial, readResult.ErrorMessage);
+                        try
+                        {
+                            session.Reader?.Disconnect();
+                            session.AssociationLoaded = false;
+                            session.InitializeMeterClient(meterParams, waitTime: 5000, retryCount: 2);
+                            await Task.Run(() => session.Reader!.InitializeConnection());
+
+                            readSw = System.Diagnostics.Stopwatch.StartNew();
+                            readResult = await ReadCompteurDataAsync(session, meter, default);
+                            readSw.Stop();
+                            outcome.ReadMs += readSw.ElapsedMilliseconds;
+                            _logger.LogInformation("Retry lecture isolee {Serial}: {Result}", serial, readResult.Success ? "OK" : readResult.ErrorMessage);
+                        }
+                        catch (Exception retryEx)
+                        {
+                            _logger.LogWarning(retryEx, "Retry isolee echoue pour {Serial}", serial);
+                        }
+                    }
+
                     if (!readResult.Success)
                     {
                         outcome.Error = readResult.ErrorMessage;
@@ -913,11 +966,16 @@ namespace DLMS_SERVICE.Services
 
                     // 6. Process instant data
                     var dataProcessingService = _dataProcessingServiceFactory.Create();
-                    await dataProcessingService.ProcessCompteurDataAsync(readResult.Data, meter.CompteurId);
+                    var processOk = await dataProcessingService.ProcessCompteurDataAsync(readResult.Data, meter.CompteurId);
+                    if (!processOk)
+                    {
+                        _logger.LogWarning("Persistance echouee pour {Serial} (CompteurId={CompteurId})",
+                            serial, meter.CompteurId);
+                    }
 
                     // 7. Read profiles (sequential, incremental, budget-aware)
                     var budgetLeft = timeoutSeconds - (int)totalSw.Elapsed.TotalSeconds;
-                    var profileResults = await ReadProfilesSequentialAsync(session, serial, default, budgetLeft);
+                    var profileResults = await ReadProfilesSequentialAsync(session, serial, default, budgetLeft, meterParams);
                     outcome.ProfileResults = profileResults;
 
                     // Success
@@ -1085,7 +1143,7 @@ namespace DLMS_SERVICE.Services
                 }
 
                 // Profile reading — sequential, prioritized, incremental
-                var profileResults = await ReadProfilesSequentialAsync(session, serial, combinedCts.Token);
+                var profileResults = await ReadProfilesSequentialAsync(session, serial, combinedCts.Token, meterConnectionParams: meterParams);
                 var profilesRead = profileResults.Count(p => p.Success);
                 _logger.LogDebug("{Serial}: {Count}/{Total} profils lus via ReadMeterWithExistingSession",
                     serial, profilesRead, profileResults.Count);
@@ -1133,7 +1191,7 @@ namespace DLMS_SERVICE.Services
                 var reader = new NonStaticReaderCommunication();
                 
                 // Utiliser Task.Run avec le timeout global pour éviter les blocages infinis
-                var readTask = Task.Run(() => reader.ReadRowsByRangeAsync(session, dateStart.ToString(), dateEnd.ToString()), ct);
+                var readTask = Task.Run(() => reader.ReadRowsByRangeAsync(session, dateStart.ToString("yyyy-MM-dd HH:mm:ss"), dateEnd.ToString("yyyy-MM-dd HH:mm:ss")), ct);
                 
                 // Attendre la lecture avec le timeout global
                 var result = await readTask;
@@ -1187,8 +1245,11 @@ namespace DLMS_SERVICE.Services
                 using var combined = CancellationTokenSource.CreateLinkedTokenSource(ct, profileCts.Token);
 
                 var reader = new DLMS_COMMUNICATION.Reader.NonStaticReaderCommunication();
+                // Format ISO 8601 invariant pour éviter les problèmes de culture (dd/MM vs MM/dd)
                 var readTask = Task.Run(
-                    () => reader.ReadRowsByRangeAsync(session, dateStart.ToString(), dateEnd.ToString()),
+                    () => reader.ReadRowsByRangeAsync(session,
+                        dateStart.ToString("yyyy-MM-dd HH:mm:ss"),
+                        dateEnd.ToString("yyyy-MM-dd HH:mm:ss")),
                     combined.Token);
 
                 var result = await readTask;
@@ -1216,7 +1277,8 @@ namespace DLMS_SERVICE.Services
             IDLMSCommunicationSession session,
             string serial,
             CancellationToken ct,
-            int budgetSecondsLeft = 0)
+            int budgetSecondsLeft = 0,
+            DLMSConnectionParameters? meterConnectionParams = null)
         {
             var results = new List<ProfileReadResult>();
             var profiles = await _profileConfig.GetOrderedProfilesAsync();
@@ -1327,13 +1389,16 @@ namespace DLMS_SERVICE.Services
                         profileResult.RowsRead = rowsInserted;
                         profileResult.DurationMs = sw.ElapsedMilliseconds;
 
-                        // Update LastReadUpTo after successful persistence
+                        // Update LastReadUpTo : utiliser dateEnd seulement si des données ont été persistées.
+                        // Si 0 lignes insérées (données partielles ou vides), ne PAS avancer le curseur
+                        // pour permettre un re-fetch au prochain cycle.
+                        var effectiveLastRead = rowsInserted > 0 ? dateEnd : dateStart;
                         using var scope = _serviceProvider.CreateScope();
                         var cmdRepo = scope.ServiceProvider.GetRequiredService<IMeterProfileReadHistoryCommandRepository>();
-                        await cmdRepo.UpsertAsync(serial, profile.ProfileObis, dateEnd, rowsInserted, sw.ElapsedMilliseconds);
+                        await cmdRepo.UpsertAsync(serial, profile.ProfileObis, effectiveLastRead, rowsInserted, sw.ElapsedMilliseconds);
 
-                        _logger.LogDebug("Profil {Obis} lu pour {Serial}: {Rows} lignes en {Ms}ms ({Start} -> {End})",
-                            profile.ProfileObis, serial, rowsInserted, sw.ElapsedMilliseconds, dateStart, dateEnd);
+                        _logger.LogDebug("Profil {Obis} lu pour {Serial}: {Rows} lignes en {Ms}ms ({Start} -> {End}), curseur={Cursor}",
+                            profile.ProfileObis, serial, rowsInserted, sw.ElapsedMilliseconds, dateStart, dateEnd, effectiveLastRead);
                     }
                     else
                     {
@@ -1344,21 +1409,24 @@ namespace DLMS_SERVICE.Services
                         _logger.LogWarning("Echec profil {Obis} pour {Serial}: {Error}",
                             profile.ProfileObis, serial, readResult.ErrorMessage);
 
-                        // If timeout, try HDLC recovery
-                        if (readResult.ErrorMessage.Contains("Timeout"))
+                        // HDLC recovery on ANY failure (not just timeout)
+                        try
                         {
-                            try
+                            session.Reader?.Disconnect();
+                            session.AssociationLoaded = false;
+                            session.ScalersLoaded = false;
+                            if (meterConnectionParams != null)
                             {
-                                session.Reader?.Disconnect();
-                                session.Reader?.InitializeConnection();
-                                _logger.LogDebug("HDLC reconnecte apres timeout profil {Obis}", profile.ProfileObis);
+                                session.InitializeMeterClient(meterConnectionParams, waitTime: 5000, retryCount: 1);
                             }
-                            catch (Exception reconnEx)
-                            {
-                                _logger.LogWarning(reconnEx, "HDLC reconnexion echouee apres timeout {Obis}, arret profils", profile.ProfileObis);
-                                results.Add(profileResult);
-                                break;
-                            }
+                            session.Reader!.InitializeConnection();
+                            _logger.LogDebug("HDLC reconnecte apres echec profil {Obis}", profile.ProfileObis);
+                        }
+                        catch (Exception reconnEx)
+                        {
+                            _logger.LogWarning(reconnEx, "HDLC reconnexion echouee apres echec {Obis}, arret profils", profile.ProfileObis);
+                            results.Add(profileResult);
+                            break;
                         }
                     }
                 }
@@ -1462,8 +1530,7 @@ namespace DLMS_SERVICE.Services
             {
                 var reader = new NonStaticReaderCommunication();
 
-                // ReadListAsync = batch DLMS (1 seul aller-retour réseau au lieu de N)
-                var readTask = Task.Run(() => reader.ReadListAsync(session), ct);
+                var readTask = Task.Run(() => reader.ReadAsync(session), ct);
 
                 var result = await readTask;
 

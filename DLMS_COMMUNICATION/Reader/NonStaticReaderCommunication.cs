@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using Gurux.Common;
 using Gurux.DLMS;
 using Gurux.DLMS.Enums;
@@ -181,8 +182,12 @@ namespace DLMS_COMMUNICATION.Reader
                     session.AssociationLoaded = true;
                 }
 
-                // 🔴 CRITIQUE POUR LES SCALERS DLMS
-                session.Reader.GetScalersAndUnits();
+                // Scalers : une seule fois par session (évite les round-trips réseau redondants)
+                if (!session.ScalersLoaded)
+                {
+                    session.Reader.GetScalersAndUnits();
+                    session.ScalersLoaded = true;
+                }
 
                 var entries = new List<KeyValuePair<object[], object[]>>();
 
@@ -204,7 +209,11 @@ namespace DLMS_COMMUNICATION.Reader
                     object[] rows = session.Reader
                             .ReadRowsByRange(profile, datestart2, dateend2);
 
-                    // Colonnes + scalers
+                    // Pas de conversion scaler ici — les valeurs brutes du buffer sont
+                    // retournées telles quelles. La conversion est gérée côté front-end
+                    // car le facteur varie selon le modèle de compteur.
+
+                    // Colonnes
                     object[] cols = new object[captureObjects.Length];
 
                     for (int i = 0; i < captureObjects.Length; i++)
@@ -324,6 +333,52 @@ namespace DLMS_COMMUNICATION.Reader
             {
                 _logger?.LogError(ex, "Erreur lors de la lecture par entrée");
                 return jsonText;
+            }
+        }
+
+        /// <summary>
+        /// Divise les valeurs du buffer profil par le scaler Gurux pour obtenir
+        /// les valeurs conformes aux exports constructeur.
+        /// Le buffer DLMS stocke: raw × scaler. On veut: raw (= buffer ÷ scaler).
+        /// Scaler Gurux = 10^exposant (ex: 1000 pour kWh→Wh, 10 pour A×10, 100 pour V×100)
+        /// </summary>
+        private void ApplyInverseScalers(object[] rows, double[] scalers)
+        {
+            foreach (var row in rows)
+            {
+                if (row is object[] rowArray)
+                {
+                    for (int i = 0; i < rowArray.Length && i < scalers.Length; i++)
+                    {
+                        var scaler = scalers[i];
+                        // Skip: non initialisé (0), pas de scaling (1), ou invalide
+                        if (scaler == 0 || scaler == 1 || double.IsNaN(scaler) || double.IsInfinity(scaler))
+                            continue;
+                        if (rowArray[i] == null) continue;
+
+                        try
+                        {
+                            if (rowArray[i] is long l)
+                                rowArray[i] = (double)l / scaler;
+                            else if (rowArray[i] is int n)
+                                rowArray[i] = (double)n / scaler;
+                            else if (rowArray[i] is uint u)
+                                rowArray[i] = (double)u / scaler;
+                            else if (rowArray[i] is ulong ul)
+                                rowArray[i] = (double)ul / scaler;
+                            else if (rowArray[i] is double d)
+                                rowArray[i] = d / scaler;
+                            else if (rowArray[i] is float f)
+                                rowArray[i] = (double)f / scaler;
+                            else if (rowArray[i] is decimal dec)
+                                rowArray[i] = (double)dec / scaler;
+                        }
+                        catch
+                        {
+                            // Valeur non convertible, garder telle quelle
+                        }
+                    }
+                }
             }
         }
 

@@ -6,8 +6,9 @@ public class MultiPassConfig
     public int MaxConcurrentIps { get; set; } = 8;
     public double AdaptiveTimeoutMultiplier { get; set; } = 2.5;
     public int MinAdaptiveTimeoutSeconds { get; set; } = 90;
-    public int PacingDelayMs { get; set; } = 100;
+    public int PacingDelayMs { get; set; } = 200;
     public int TcpScanTimeoutSeconds { get; set; } = 15;
+    public int ProfileFallbackMaxHours { get; set; } = 24;
     public List<PassConfig> Passes { get; set; } = new();
 }
 

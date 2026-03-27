@@ -35,10 +35,14 @@ namespace DLMS_SERVICE.Services
                 _logger.LogDebug("Traitement des données pour le compteur ID: {CompteurId}", compteurId);
 
                 var compteurUtilities = new CompteurUtilities(_compteurCommandRepo, _compteurQueryRepo);
-                compteurUtilities.MAJCompteur(data, compteurId);
+                var success = compteurUtilities.MAJCompteur(data, compteurId);
 
-                _logger.LogDebug("✓ Données du compteur {CompteurId} traitées avec succès", compteurId);
-                return true;
+                if (!success)
+                {
+                    _logger.LogWarning("MAJCompteur a retourné false pour compteur {CompteurId} — données non persistées", compteurId);
+                }
+
+                return success;
             }
             catch (Exception ex)
             {

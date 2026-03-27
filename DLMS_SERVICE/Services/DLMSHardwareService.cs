@@ -718,13 +718,43 @@ namespace DLMS_SERVICE.Services
                     if (entry.Key.Length == 0 || entry.Value.Length == 0)
                         continue;
 
-                    DateTime dateUtc = DateTime.UtcNow;
-
                     foreach (var row in entry.Key)
                     {
                         if (row is IEnumerable<object> values)
                         {
                             var array = values.ToArray();
+
+                            // Étape 1 : extraire la date de la première colonne AVANT de traiter les données
+                            DateTime dateUtc;
+                            bool dateValid = false;
+                            if (array.Length > 0)
+                            {
+                                var dateStr = array[0]?.ToString() ?? "";
+                                if (DateTime.TryParse(dateStr, out DateTime dateValue))
+                                {
+                                    long unixTimestamp = ((DateTimeOffset)dateValue).ToUnixTimeSeconds();
+                                    dateUtc = DateTimeOffset.FromUnixTimeSeconds(unixTimestamp).UtcDateTime;
+                                    dateValid = true;
+                                }
+                                else if (long.TryParse(dateStr, out long unixTs) && unixTs > 946684800)
+                                {
+                                    dateUtc = DateTimeOffset.FromUnixTimeSeconds(unixTs).UtcDateTime;
+                                    dateValid = true;
+                                }
+                                else
+                                {
+                                    dateUtc = DateTime.MinValue;
+                                    _logger.LogWarning("Format de date invalide pour {Serial}/{Obis}: {Date} — ligne ignoree",
+                                        serialNumber, profileObis, dateStr);
+                                }
+                            }
+                            else
+                            {
+                                dateUtc = DateTime.MinValue;
+                            }
+
+                            // Si la date est invalide, ignorer TOUTE la ligne
+                            if (!dateValid) continue;
 
                             for (int i = 0; i < entry.Value.Length; i++)
                             {
@@ -734,22 +764,16 @@ namespace DLMS_SERVICE.Services
                                 {
                                     // Register profile processing
                                     var detailprofil = new Gxdlmsprofilgenericdetail();
-                                    var realValue = ((JValue)array[i]).Value;
-                                    bool isRegisterValue = realValue is decimal || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
-
-                                    if (i == 0)
+                                    object realValue;
+                                    try
                                     {
-                                        if (DateTime.TryParse(array[i].ToString(), out DateTime dateValue))
-                                        {
-                                            long unixTimestamp = ((DateTimeOffset)dateValue).ToUnixTimeSeconds();
-                                            dateUtc = DateTimeOffset.FromUnixTimeSeconds(unixTimestamp).UtcDateTime;
-                                        }
-                                        else
-                                        {
-                                            _logger.LogWarning("Format de date invalide: {Date}", array[i]);
-                                            continue;
-                                        }
+                                        realValue = ((JValue)array[i]).Value;
                                     }
+                                    catch
+                                    {
+                                        realValue = array[i];
+                                    }
+                                    bool isRegisterValue = realValue is decimal || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
 
                                     detailprofil.Value = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
                                     detailprofil.CodeObisId = codeObisDict.TryGetValue(objStr, out var codeObis) ? codeObis.Id : 0;
@@ -791,20 +815,7 @@ namespace DLMS_SERVICE.Services
                                         detailprofilevent.EventId = null;
                                     }
 
-                                    if (i == 0)
-                                    {
-                                        if (DateTime.TryParse(array[i].ToString(), out DateTime dateValue))
-                                        {
-                                            long unixTimestamp = ((DateTimeOffset)dateValue).ToUnixTimeSeconds();
-                                            dateUtc = DateTimeOffset.FromUnixTimeSeconds(unixTimestamp).UtcDateTime;
-                                        }
-                                        else
-                                        {
-                                            _logger.LogWarning("Format de date invalide: {Date}", array[i]);
-                                            continue;
-                                        }
-                                    }
-
+                                    // Date déjà extraite en amont pour toute la ligne
                                     detailprofilevent.DateEnr = dateUtc;
                                     detailprofilevent.CodeObisId = codeObisDict.TryGetValue(objStr, out var codeObisEvent) ? codeObisEvent.Id : 0;
                                     detailprofilevent.GxdlmsprofilgenericId = profilGeneric.Id;

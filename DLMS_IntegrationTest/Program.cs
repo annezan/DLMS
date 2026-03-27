@@ -11,6 +11,9 @@ using DLMS_MODELS;
 using DLMS_MODELS.CompteurEquipementDomain.Entities;
 using DLMS_SERVICE.Services;
 using DLMS_COMMUNICATION.Reader;
+using Gurux.DLMS.Enums;
+using Gurux.DLMS.Objects;
+using Task = System.Threading.Tasks.Task;
 
 namespace DLMS_IntegrationTest;
 
@@ -88,6 +91,40 @@ class TestReport
 }
 
 record CliOptions(string Mode, int PoolSize, string? FilterIp, string? FilterMeter);
+
+class ProfileReadResult
+{
+    public string ProfileObis { get; set; } = "";
+    public string ProfileName { get; set; } = "";
+    public bool Success { get; set; }
+    public int RowCount { get; set; }
+    public long DurationMs { get; set; }
+    public string Error { get; set; } = "";
+    public string? RawData { get; set; }
+    public string[]? Columns { get; set; }
+    public List<object[]>? RowsRaw { get; set; }
+    public List<object[]>? RowsScaled { get; set; }
+    public List<object[]>? RowsWithTcTt { get; set; }
+}
+
+class ScalerInfo
+{
+    public double Scaler { get; set; }
+    public string Unit { get; set; } = "";
+    public int UnitCode { get; set; }
+}
+
+class MeterProfileReport
+{
+    public string Serial { get; set; } = "";
+    public string Ip { get; set; } = "";
+    public bool ConnectionSuccess { get; set; }
+    public long HdlcMs { get; set; }
+    public List<ProfileReadResult> Profiles { get; set; } = new();
+    public string Error { get; set; } = "";
+    public Dictionary<string, object?> TcTtValues { get; set; } = new();
+    public Dictionary<string, ScalerInfo> Scalers { get; set; } = new();
+}
 
 // ===== Multi-pass configuration =====
 
@@ -305,6 +342,7 @@ class Program
             {
                 case "--list":
                 case "--seq":
+                case "--profiles":
                     mode = args[i];
                     break;
                 case "--parallel":
@@ -469,6 +507,7 @@ class Program
                 Console.WriteLine("  dotnet run --project DLMS_IntegrationTest/ -- <numero>    Test un seul compteur");
                 Console.WriteLine("  dotnet run --project DLMS_IntegrationTest/ -- --seq       Lecture sequentielle");
                 Console.WriteLine("  dotnet run --project DLMS_IntegrationTest/ -- --parallel [N]  Lecture parallele (pool de N IPs, defaut 10)");
+                Console.WriteLine("  dotnet run --project DLMS_IntegrationTest/ -- --profiles  Lecture des profils (log detaille par compteur)");
                 Console.WriteLine();
                 Console.WriteLine("  Filtres (combinables avec --seq ou --parallel) :");
                 Console.WriteLine("    --ip <ADRESSE_IP>       Tester uniquement les compteurs d'un concentrateur");
@@ -480,6 +519,12 @@ class Program
                 Console.WriteLine("    DLMS_IntegrationTest.exe --seq --meter 58014077");
                 Console.WriteLine("    DLMS_IntegrationTest.exe --ip 10.60.8.185");
                 Console.WriteLine("    DLMS_IntegrationTest.exe --meter 58014077");
+                return 0;
+            }
+
+            if (options.Mode == "--profiles")
+            {
+                await RunProfilesTest(metersWithKeys, dbOptions, configuration);
                 return 0;
             }
 
@@ -1921,6 +1966,534 @@ class Program
         totalSw.Stop();
         Console.WriteLine($"=== TEST REUSSI en {totalSw.Elapsed.TotalSeconds:F1}s ===");
         return 0;
+    }
+
+    // ===== RunProfilesTest — lecture des profils avec log détaillé =====
+
+    private static readonly (string Obis, string Name, int TimeoutSeconds)[] ProfileDefinitions = new[]
+    {
+        ("1.0.99.1.0.255", "Load Profile 1 (horaire)", 60),
+        ("1.0.99.2.0.255", "Load Profile 2 (5 min)", 120),
+        ("1.0.99.3.0.255", "Load Profile 3 (journalier)", 30),
+        ("0.0.98.1.0.255", "Billing Profile", 20),
+        ("0.0.99.98.0.255", "Event Log 0", 20),
+        ("0.0.99.98.1.255", "Event Log 1", 20),
+        ("0.0.99.98.2.255", "Event Log 2", 20),
+        ("0.0.99.98.3.255", "Event Log 3", 20),
+    };
+
+    private static readonly string[] TcTtObis = new[]
+    {
+        "1.0.0.4.2.255",  // CT ratio numerator
+        "1.0.0.4.3.255",  // CT ratio denominator / VT
+        "1.0.0.4.5.255",  // VT ratio numerator
+        "1.0.0.4.6.255",  // VT ratio denominator
+    };
+
+    private static async Task RunProfilesTest(
+        List<MeterInfo> meters, DbContextOptions<DLMSDBContext> dbOptions, IConfiguration configuration)
+    {
+        Console.WriteLine("=== Mode LECTURE DES PROFILS (log detaille) ===");
+        Console.WriteLine();
+
+        var outputDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "profile_logs");
+        Directory.CreateDirectory(outputDir);
+
+        var contextFactory = new SimpleDbContextFactory(dbOptions);
+        var cache = new MemoryCache(new MemoryCacheOptions { SizeLimit = 100 });
+        var keyServiceLogger = _loggerFactory.CreateLogger<DLMSKeyService>();
+        var keyService = new DLMSKeyService(contextFactory, cache, keyServiceLogger);
+        var factoryLogger = _loggerFactory.CreateLogger<DLMSGuruxSessionFactory>();
+        var sessionLogger = _loggerFactory.CreateLogger<DLMSGuruxSession>();
+        var sessionFactory = new DLMSGuruxSessionFactory(factoryLogger, sessionLogger);
+
+        // Plage de lecture configurable via appsettings.json (clé "ProfileReadHours", défaut 6)
+        var profileReadHours = int.TryParse(configuration["ProfileReadHours"], out var h) ? h : 6;
+        var dateEnd = DateTime.Now;
+        var dateStart = dateEnd.AddHours(-profileReadHours);
+        Console.WriteLine($"  Plage de lecture: {dateStart:yyyy-MM-dd HH:mm} -> {dateEnd:yyyy-MM-dd HH:mm}");
+        Console.WriteLine($"  Logs dans: {outputDir}");
+        Console.WriteLine();
+
+        var allReports = new List<MeterProfileReport>();
+
+        foreach (var meter in meters)
+        {
+            var report = new MeterProfileReport { Serial = meter.Serial, Ip = meter.Ip };
+            Console.WriteLine($"--- {meter.Serial} ({meter.Ip}:{meter.Port}) ---");
+
+            // 1. Fresh TCP connection
+            var transportParams = new DLMSConnectionParameters
+            {
+                AddressIp = meter.Ip,
+                Port = meter.Port,
+                Trace = TraceLevel.Off
+            };
+
+            var session = sessionFactory.CreateSession(transportParams);
+            try
+            {
+                using var tcpCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+                var connected = await session.OpenTransportAsync(tcpCts.Token);
+                if (!connected)
+                {
+                    report.Error = "TCP echec";
+                    Console.WriteLine($"  TCP ECHEC");
+                    allReports.Add(report);
+                    continue;
+                }
+
+                // 2. HDLC association
+                var keys = await keyService.GetKeysAsync("read", meter.Serial, "read");
+                if (keys == null || !keys.IsValid)
+                {
+                    report.Error = "Cles invalides";
+                    Console.WriteLine($"  CLES INVALIDES");
+                    await session.DisconnectAsync();
+                    allReports.Add(report);
+                    continue;
+                }
+
+                var meterParams = new DLMSConnectionParameters
+                {
+                    AddressIp = meter.Ip, Port = meter.Port,
+                    ClientAddress = "read", SerialNumber = meter.Serial,
+                    InterfaceType = "HDLC",
+                    Password = keys.Password ?? "",
+                    AuthenticationKey = keys.AuthenticationKey,
+                    UnicastKey = keys.UnicastKey,
+                    Trace = TraceLevel.Off, UseGbt = true
+                };
+
+                session.InitializeMeterClient(meterParams, waitTime: 5000, retryCount: 1);
+
+                var hdlcSw = Stopwatch.StartNew();
+                session.Reader!.InitializeConnection();
+                hdlcSw.Stop();
+                report.HdlcMs = hdlcSw.ElapsedMilliseconds;
+                report.ConnectionSuccess = true;
+                Console.WriteLine($"  HDLC OK ({hdlcSw.ElapsedMilliseconds}ms)");
+
+                // 2b. Lire scalers et unites
+                try
+                {
+                    session.Reader.GetScalersAndUnits();
+                    session.ScalersLoaded = true;
+
+                    var regObjects = session.Client!.Objects.GetObjects(
+                        new ObjectType[] { ObjectType.Register, ObjectType.ExtendedRegister, ObjectType.DemandRegister });
+
+                    foreach (GXDLMSObject obj in regObjects)
+                    {
+                        double scaler = 1;
+                        int unitCode = 0;
+                        if (obj is GXDLMSRegister reg)
+                        {
+                            scaler = reg.Scaler;
+                            unitCode = (int)reg.Unit;
+                        }
+                        else if (obj is GXDLMSExtendedRegister ereg)
+                        {
+                            scaler = ereg.Scaler;
+                            unitCode = (int)ereg.Unit;
+                        }
+                        else if (obj is GXDLMSDemandRegister dreg)
+                        {
+                            scaler = dreg.Scaler;
+                            unitCode = (int)dreg.Unit;
+                        }
+                        report.Scalers[obj.LogicalName] = new ScalerInfo
+                        {
+                            Scaler = scaler,
+                            Unit = ((Unit)unitCode).ToString(),
+                            UnitCode = unitCode
+                        };
+                    }
+
+                    // Log key scalers (energy, power, current, voltage, frequency)
+                    var keyScalers = report.Scalers
+                        .Where(s => s.Value.UnitCode > 0)
+                        .OrderBy(s => s.Key)
+                        .Take(8);
+                    Console.WriteLine($"  Scalers: {report.Scalers.Count} registres charges");
+                    foreach (var ks in keyScalers)
+                        Console.WriteLine($"    {ks.Key}: scaler={ks.Value.Scaler}, unit={ks.Value.Unit} ({ks.Value.UnitCode})");
+                }
+                catch (Exception scalerEx)
+                {
+                    Console.WriteLine($"  WARN: Scalers non lus: {scalerEx.Message}");
+                }
+
+                // 2c. Lire TC/TT
+                double tcVal = 1.0, ttVal = 1.0;
+                try
+                {
+                    foreach (var obisCode in TcTtObis)
+                    {
+                        try
+                        {
+                            var obj = session.Client!.Objects.FindByLN(ObjectType.None, obisCode);
+                            if (obj != null)
+                            {
+                                var val = session.Reader.Read(obj, 2);
+                                report.TcTtValues[obisCode] = val;
+                            }
+                            else
+                            {
+                                report.TcTtValues[obisCode] = null;
+                            }
+                        }
+                        catch (Exception tcEx)
+                        {
+                            report.TcTtValues[obisCode] = $"ERR:{tcEx.Message}";
+                        }
+                    }
+
+                    // Compute TC and TT values
+                    if (report.TcTtValues.TryGetValue("1.0.0.4.2.255", out var ctNum) && ctNum != null)
+                    {
+                        if (double.TryParse(ctNum.ToString(), out double v) && v > 0) tcVal = v;
+                    }
+                    if (report.TcTtValues.TryGetValue("1.0.0.4.5.255", out var vtNum) && vtNum != null)
+                    {
+                        if (double.TryParse(vtNum.ToString(), out double v) && v > 0) ttVal = v;
+                    }
+
+                    Console.WriteLine($"  TC={tcVal}, TT={ttVal}, TC*TT={tcVal * ttVal}");
+                }
+                catch (Exception tcttEx)
+                {
+                    Console.WriteLine($"  WARN: TC/TT non lus: {tcttEx.Message}");
+                }
+
+                // 3. Lire chaque profil (avec reconnexion HDLC après échec)
+                bool needsReconnect = false;
+                foreach (var (obis, name, timeout) in ProfileDefinitions)
+                {
+                    var profileResult = new ProfileReadResult { ProfileObis = obis, ProfileName = name };
+                    Console.Write($"  {name} ({obis}) ... ");
+
+                    // Reconnexion HDLC si le profil précédent a échoué
+                    if (needsReconnect)
+                    {
+                        try
+                        {
+                            Console.Write("[reconnexion HDLC] ");
+                            try { session.Reader?.Disconnect(); } catch { }
+                            session.AssociationLoaded = false;
+                            session.ScalersLoaded = false;
+                            session.InitializeMeterClient(meterParams, waitTime: 5000, retryCount: 1);
+                            session.Reader!.InitializeConnection();
+                            needsReconnect = false;
+                        }
+                        catch (Exception reconnEx)
+                        {
+                            profileResult.Error = $"Reconnexion HDLC echouee: {reconnEx.Message}";
+                            profileResult.DurationMs = 0;
+                            Console.WriteLine($"RECONNEXION ECHOUEE — arret profils");
+                            report.Profiles.Add(profileResult);
+                            break;
+                        }
+                    }
+
+                    session.ReadObjects.Clear();
+                    session.ReadObjects.Add(new KeyValuePair<string, int>(obis, 2));
+
+                    var reader = new NonStaticReaderCommunication();
+                    var sw = Stopwatch.StartNew();
+                    try
+                    {
+                        var result = await Task.Run(() =>
+                            reader.ReadRowsByRangeAsync(session,
+                                dateStart.ToString("yyyy-MM-dd HH:mm:ss"),
+                                dateEnd.ToString("yyyy-MM-dd HH:mm:ss")))
+                            .WaitAsync(TimeSpan.FromSeconds(timeout));
+
+                        sw.Stop();
+                        profileResult.DurationMs = sw.ElapsedMilliseconds;
+
+                        if (string.IsNullOrEmpty(result) || result == "Lecture impossible")
+                        {
+                            profileResult.Error = "Lecture impossible";
+                            Console.WriteLine($"ECHEC ({sw.ElapsedMilliseconds}ms)");
+                            needsReconnect = true;
+                        }
+                        else
+                        {
+                            profileResult.Success = true;
+                            profileResult.RawData = result;
+
+                            // Deserialize entries: Key=rows, Value=columns (OBIS codes)
+                            var entries = Newtonsoft.Json.JsonConvert.DeserializeObject<
+                                List<KeyValuePair<Newtonsoft.Json.Linq.JArray, object[]>>>(result);
+
+                            if (entries != null && entries.Count > 0)
+                            {
+                                var entry = entries[0];
+
+                                // Extract column names
+                                var columns = entry.Value.Select(c => c?.ToString() ?? "").ToArray();
+                                profileResult.Columns = columns;
+
+                                // Build per-column scaler and TC/TT factor arrays
+                                var colScalers = new double[columns.Length];
+                                var colTcTtFactors = new double[columns.Length];
+                                for (int ci = 0; ci < columns.Length; ci++)
+                                {
+                                    colScalers[ci] = report.Scalers.TryGetValue(columns[ci], out var si)
+                                        ? si.Scaler : 1.0;
+                                    var (factor, _) = GetTcTtFactor(columns[ci], tcVal, ttVal);
+                                    colTcTtFactors[ci] = factor;
+                                }
+
+                                // Process rows
+                                profileResult.RowsRaw = new List<object[]>();
+                                profileResult.RowsScaled = new List<object[]>();
+                                profileResult.RowsWithTcTt = new List<object[]>();
+
+                                var rowsArray = entry.Key;
+                                foreach (var rowToken in rowsArray)
+                                {
+                                    object[] rawRow;
+                                    if (rowToken is Newtonsoft.Json.Linq.JArray rowArr)
+                                        rawRow = rowArr.Select(t => (object)t).ToArray();
+                                    else
+                                        rawRow = new object[] { rowToken };
+
+                                    profileResult.RowsRaw.Add(rawRow);
+
+                                    // Scaled values: raw * colScaler
+                                    var scaledRow = new object[rawRow.Length];
+                                    var tcttRow = new object[rawRow.Length];
+                                    for (int ci = 0; ci < rawRow.Length && ci < columns.Length; ci++)
+                                    {
+                                        if (double.TryParse(rawRow[ci]?.ToString(), out double numVal))
+                                        {
+                                            var scaled = numVal * colScalers[ci];
+                                            scaledRow[ci] = scaled;
+                                            tcttRow[ci] = scaled * colTcTtFactors[ci];
+                                        }
+                                        else
+                                        {
+                                            scaledRow[ci] = rawRow[ci];
+                                            tcttRow[ci] = rawRow[ci];
+                                        }
+                                    }
+                                    profileResult.RowsScaled.Add(scaledRow);
+                                    profileResult.RowsWithTcTt.Add(tcttRow);
+                                }
+
+                                profileResult.RowCount = profileResult.RowsRaw.Count;
+                            }
+                            else
+                            {
+                                profileResult.RowCount = 0;
+                            }
+
+                            Console.WriteLine($"OK — {profileResult.RowCount} lignes ({sw.ElapsedMilliseconds}ms)");
+
+                            // Sauvegarder le JSON brut dans un fichier
+                            var fileName = $"{meter.Serial}_{obis.Replace(".", "_")}_{DateTime.Now:yyyyMMdd_HHmmss}.json";
+                            var filePath = Path.Combine(outputDir, fileName);
+                            await File.WriteAllTextAsync(filePath, result);
+                        }
+                    }
+                    catch (TimeoutException)
+                    {
+                        sw.Stop();
+                        profileResult.DurationMs = sw.ElapsedMilliseconds;
+                        profileResult.Error = $"Timeout ({timeout}s)";
+                        Console.WriteLine($"TIMEOUT ({timeout}s)");
+                        needsReconnect = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        sw.Stop();
+                        profileResult.DurationMs = sw.ElapsedMilliseconds;
+                        profileResult.Error = ex.Message;
+                        Console.WriteLine($"ERREUR — {ex.Message}");
+                        needsReconnect = true;
+                    }
+
+                    report.Profiles.Add(profileResult);
+                }
+
+                // 4. Sauvegarder JSON enrichi par compteur
+                try
+                {
+                    var enrichedReport = new
+                    {
+                        serial = meter.Serial,
+                        ip = meter.Ip,
+                        timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                        tc_tt = report.TcTtValues.ToDictionary(
+                            kv => kv.Key,
+                            kv => kv.Value?.ToString() ?? "null"),
+                        scalers = report.Scalers.ToDictionary(
+                            kv => kv.Key,
+                            kv => new { kv.Value.Scaler, kv.Value.Unit, kv.Value.UnitCode }),
+                        profiles = report.Profiles.Select(p => new
+                        {
+                            obis = p.ProfileObis,
+                            name = p.ProfileName,
+                            columns = p.Columns,
+                            rows_count = p.RowCount,
+                            duration_ms = p.DurationMs,
+                            success = p.Success,
+                            error = p.Error,
+                            first_rows_comparison = (p.RowsRaw != null && p.RowsRaw.Count > 0)
+                                ? p.RowsRaw.Take(3).Select((row, ri) => new
+                                {
+                                    brut = row,
+                                    scale = p.RowsScaled?.ElementAtOrDefault(ri),
+                                    avec_tc_tt = p.RowsWithTcTt?.ElementAtOrDefault(ri)
+                                }).ToArray()
+                                : null
+                        }).ToArray()
+                    };
+
+                    var enrichedJson = Newtonsoft.Json.JsonConvert.SerializeObject(enrichedReport, Newtonsoft.Json.Formatting.Indented);
+                    var enrichedFileName = $"{meter.Serial}_enriched_{DateTime.Now:yyyyMMdd_HHmmss}.json";
+                    var enrichedFilePath = Path.Combine(outputDir, enrichedFileName);
+                    await File.WriteAllTextAsync(enrichedFilePath, enrichedJson);
+                    Console.WriteLine($"  JSON enrichi: {enrichedFileName}");
+                }
+                catch (Exception enrichEx)
+                {
+                    Console.WriteLine($"  WARN: JSON enrichi non sauvegarde: {enrichEx.Message}");
+                }
+
+                // Disconnect
+                try { session.Reader?.Disconnect(); } catch { }
+                await session.DisconnectAsync();
+            }
+            catch (Exception ex)
+            {
+                report.Error = ex.Message;
+                Console.WriteLine($"  ERREUR: {ex.Message}");
+                try { await session.DisconnectAsync(); } catch { }
+            }
+
+            allReports.Add(report);
+            Console.WriteLine();
+        }
+
+        // === Rapport final ===
+        Console.WriteLine("=== RAPPORT LECTURE PROFILS ===");
+        Console.WriteLine();
+        Console.WriteLine($"  {"Compteur",-12} {"HDLC",-8} {"Prof1",-10} {"Prof2",-10} {"Prof3",-10} {"Billing",-10} {"Events",-10}");
+        Console.WriteLine($"  {new string('-', 70)}");
+
+        foreach (var r in allReports)
+        {
+            if (!r.ConnectionSuccess)
+            {
+                Console.WriteLine($"  {r.Serial,-12} {r.Error}");
+                continue;
+            }
+
+            var prof1 = r.Profiles.FirstOrDefault(p => p.ProfileObis == "1.0.99.1.0.255");
+            var prof2 = r.Profiles.FirstOrDefault(p => p.ProfileObis == "1.0.99.2.0.255");
+            var prof3 = r.Profiles.FirstOrDefault(p => p.ProfileObis == "1.0.99.3.0.255");
+            var billing = r.Profiles.FirstOrDefault(p => p.ProfileObis == "0.0.98.1.0.255");
+            var events = r.Profiles.Where(p => p.ProfileObis.StartsWith("0.0.99.98."));
+
+            string Fmt(ProfileReadResult? p) => p == null ? "-" :
+                p.Success ? $"{p.RowCount}r/{p.DurationMs}ms" : $"ERR";
+
+            var eventSummary = events.Any()
+                ? $"{events.Count(p => p.Success)}/{events.Count()} OK"
+                : "-";
+
+            Console.WriteLine($"  {r.Serial,-12} {r.HdlcMs + "ms",-8} {Fmt(prof1),-10} {Fmt(prof2),-10} {Fmt(prof3),-10} {Fmt(billing),-10} {eventSummary,-10}");
+        }
+
+        Console.WriteLine();
+        Console.WriteLine($"  Fichiers JSON sauvegardes dans: {outputDir}");
+        Console.WriteLine();
+
+        // Detail enrichi des profils par compteur
+        foreach (var r in allReports.Where(r => r.ConnectionSuccess))
+        {
+            Console.WriteLine($"  === {r.Serial} ({r.Ip}) ===");
+
+            // TC/TT values
+            if (r.TcTtValues.Count > 0)
+            {
+                Console.WriteLine($"    TC/TT:");
+                foreach (var kv in r.TcTtValues)
+                    Console.WriteLine($"      {kv.Key} = {kv.Value ?? "null"}");
+            }
+
+            // Key scalers (energy, power, current, voltage, frequency)
+            var keyScalerObis = r.Scalers
+                .Where(s => s.Value.UnitCode > 0)
+                .OrderBy(s => s.Key)
+                .Take(8);
+            if (keyScalerObis.Any())
+            {
+                Console.WriteLine($"    Scalers cles:");
+                foreach (var ks in keyScalerObis)
+                    Console.WriteLine($"      {ks.Key}: scaler={ks.Value.Scaler}, unit={ks.Value.Unit}");
+            }
+
+            // Per-profile detail
+            foreach (var p in r.Profiles)
+            {
+                var status = p.Success ? $"{p.RowCount} lignes en {p.DurationMs}ms" : $"ECHEC: {p.Error}";
+                Console.WriteLine($"    {p.ProfileName,-30} {status}");
+
+                // Show first 2 rows in 3 views for successful profiles
+                if (p.Success && p.RowsRaw != null && p.RowsRaw.Count > 0 && p.Columns != null)
+                {
+                    // Abbreviated column headers: C.D from OBIS (e.g., "1.0.1.8.0.255" -> "1.8")
+                    var colHeaders = p.Columns.Select(col =>
+                    {
+                        var parts = col.Split('.');
+                        return parts.Length >= 6 ? $"{parts[2]}.{parts[3]}" : col;
+                    }).ToArray();
+                    Console.WriteLine($"      Colonnes: [{string.Join(", ", colHeaders)}]");
+
+                    var rowsToShow = Math.Min(2, p.RowsRaw.Count);
+                    for (int ri = 0; ri < rowsToShow; ri++)
+                    {
+                        string FmtRow(object[]? row) => row == null ? "null"
+                            : string.Join(", ", row.Select(v =>
+                            {
+                                var s = v?.ToString() ?? "null";
+                                return s.Length > 16 ? s.Substring(0, 16) + ".." : s;
+                            }));
+
+                        Console.WriteLine($"      Ligne {ri}: brut=[{FmtRow(p.RowsRaw[ri])}]");
+                        Console.WriteLine($"              scale=[{FmtRow(p.RowsScaled?.ElementAtOrDefault(ri))}]");
+                        Console.WriteLine($"              tc*tt=[{FmtRow(p.RowsWithTcTt?.ElementAtOrDefault(ri))}]");
+                    }
+                }
+            }
+            Console.WriteLine();
+        }
+    }
+
+    private static (double factor, string label) GetTcTtFactor(string obisCode, double tc, double tt)
+    {
+        var parts = obisCode.Split('.');
+        if (parts.Length < 6) return (1.0, "x1");
+        if (!int.TryParse(parts[2], out int c) || !int.TryParse(parts[3], out int d))
+            return (1.0, "x1");
+
+        // Energy registers (D=8): xTCxTT
+        if (d == 8) return (tc * tt, $"xTCxTT({tc * tt})");
+
+        // Power registers (D=7):
+        if (d == 7)
+        {
+            if (c == 31 || c == 51 || c == 71) return (tc, $"xTC({tc})");
+            if (c == 32 || c == 52 || c == 72) return (tt, $"xTT({tt})");
+            if (c == 14 || c == 81) return (1.0, "x1");
+            return (tc * tt, $"xTCxTT({tc * tt})");
+        }
+
+        return (1.0, "x1");
     }
 
     // ===== Multi-pass helpers =====

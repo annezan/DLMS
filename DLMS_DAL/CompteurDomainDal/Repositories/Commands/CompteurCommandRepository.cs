@@ -79,66 +79,63 @@ namespace DLMS_DAL.CompteurDomainDal.Repositories
 
         }
 
-        public bool MAJCompteur(string result,int Id)
+        public bool MAJCompteur(string result, int Id)
         {
             try
             {
-                
                 var Deserializeresult = JsonConvert.DeserializeObject<Dictionary<string, string>>(result);
+                if (Deserializeresult == null || Deserializeresult.Count == 0)
+                {
+                    System.Diagnostics.Debug.WriteLine($"MAJCompteur: données vides pour compteur Id={Id}");
+                    return false;
+                }
+
                 var Compteur_update = _context.Compteur.FirstOrDefault(x => x.Id == Id);
+                if (Compteur_update == null)
+                {
+                    System.Diagnostics.Debug.WriteLine($"MAJCompteur: compteur Id={Id} introuvable en base");
+                    return false;
+                }
+
                 foreach (var item1 in Deserializeresult)
                 {
-                    if (Compteur_update != null)
+                    if (item1.Key == "0.0.42.0.0.255" && item1.Value?.Length >= 7)
                     {
-                        if (item1.Key == "0.0.42.0.0.255")
-                        {
-                            Compteur_update.Typecompteur = Compteur_update.Typecompteur == item1.Value.ToString().Substring(3, 4) ? Compteur_update.Typecompteur: item1.Value.ToString().Substring(3, 4);
-                        }
-                        else if (item1.Key == "1.0.99.1.0.255")
-                        {
-                            var i = Convert.ToInt32(item1.Value) / 60;
-                            Compteur_update.EnergyProfilePeriod = i.ToString();
-                            Compteur_update.EnergyProfilePeriod = Compteur_update.EnergyProfilePeriod == i.ToString() ? Compteur_update.EnergyProfilePeriod : i.ToString();
-
-                        }
-                        else if (item1.Key == "1.0.99.2.0.255")
-                        {
-                            var i = Convert.ToInt32(item1.Value) / 60;
-                            Compteur_update.TechnicalProfilePeriod = Compteur_update.TechnicalProfilePeriod == i.ToString() ? Compteur_update.TechnicalProfilePeriod : i.ToString();
-
-                        }
-                        else if (item1.Key == "0.0.0.2.8.255")
-                        {
-                            Compteur_update.CrcFirmware = Compteur_update.CrcFirmware == item1.Value.ToString() ? Compteur_update.CrcFirmware : item1.Value.ToString();
-
-                        }
-                        else if (item1.Key == "0.0.0.2.0.255")
-                        {
-                            Compteur_update.VersionFirmware = Compteur_update.VersionFirmware == item1.Value.ToString() ? Compteur_update.VersionFirmware : item1.Value.ToString();
-
-                        }
-                        else if (item1.Key == "1.0.0.2.2.255")
-                        {
-                            Compteur_update.Tarif = item1.Value.ToString();
-                            Compteur_update.Tarif = Compteur_update.Tarif == item1.Value.ToString() ? Compteur_update.Tarif : item1.Value.ToString();
-
-                        }
-      
+                        Compteur_update.Typecompteur = item1.Value.ToString().Substring(3, 4);
                     }
-
-                        
+                    else if (item1.Key == "1.0.99.1.0.255")
+                    {
+                        if (int.TryParse(item1.Value, out int val))
+                            Compteur_update.EnergyProfilePeriod = (val / 60).ToString();
+                    }
+                    else if (item1.Key == "1.0.99.2.0.255")
+                    {
+                        if (int.TryParse(item1.Value, out int val))
+                            Compteur_update.TechnicalProfilePeriod = (val / 60).ToString();
+                    }
+                    else if (item1.Key == "0.0.0.2.8.255")
+                    {
+                        Compteur_update.CrcFirmware = item1.Value?.ToString();
+                    }
+                    else if (item1.Key == "0.0.0.2.0.255")
+                    {
+                        Compteur_update.VersionFirmware = item1.Value?.ToString();
+                    }
+                    else if (item1.Key == "1.0.0.2.2.255")
+                    {
+                        Compteur_update.Tarif = item1.Value?.ToString();
+                    }
                 }
+
                 _context.Compteur.Update(Compteur_update);
                 _context.SaveChanges();
                 return true;
-                                
-
             }
             catch (Exception ex)
             {
-                return false;
+                System.Diagnostics.Debug.WriteLine($"MAJCompteur ERREUR compteur Id={Id}: {ex.Message}");
+                throw; // remonter l'exception pour que l'appelant sache que ça a échoué
             }
-
         }
 
         public async Task<Compteur> DeleteCompteur(Compteur compteur)

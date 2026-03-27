@@ -755,8 +755,7 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
     {
         var serial = meter.Compteur?.NumeroCompteur;
         if (string.IsNullOrEmpty(serial)) return false;
-        return _healthTracker.GetCategory(serial) == MeterPerformanceCategory.Fast
-            || _healthTracker.GetCategory(serial) == MeterPerformanceCategory.Medium;
+        return File.Exists(Path.Combine("associations", $"{serial}_Read.xml"));
     }
 
     private int ComputeAdaptiveTimeout(

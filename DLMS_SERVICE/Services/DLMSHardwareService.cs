@@ -438,7 +438,7 @@ namespace DLMS_SERVICE.Services
                                             // Création objet detailprofil
                                             var detailprofil = new Gxdlmsprofilgenericdetail();
                                             var realValue = ((JValue)array[i]).Value;
-                                            bool isRegisterValue = realValue is decimal || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
+                                            bool isRegisterValue = realValue is decimal || realValue is double || realValue is float || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
                                             if (i == 0)
                                             {
                                                 if (DateTime.TryParse(array[i].ToString(), out DateTime dateValue))
@@ -743,7 +743,7 @@ namespace DLMS_SERVICE.Services
                                     {
                                         realValue = array[i];
                                     }
-                                    bool isRegisterValue = realValue is decimal || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
+                                    bool isRegisterValue = realValue is decimal || realValue is double || realValue is float || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
 
                                     var rawStr = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
                                     detailprofil.RawValue = rawStr;
@@ -1045,7 +1045,7 @@ namespace DLMS_SERVICE.Services
                                         // Création objet ResultatCommande
                                         var commande = new ResultatCommandeCompteur();
                                         var realValue = ((JValue)array[i]).Value;
-                                        bool isRegisterValue = realValue is decimal || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
+                                        bool isRegisterValue = realValue is decimal || realValue is double || realValue is float || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
                                         
                                         if (i == 0)
                                         {

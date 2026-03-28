@@ -24,11 +24,12 @@ public class ProfileReadingConfig : IProfileReadingConfig
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<ProfileReadingConfig> _logger;
     private readonly int _fallbackMaxHoursOverride;
+    private readonly int _maxProfilesToRead;
     private List<ProfileReadingEntry>? _cached;
 
     private static readonly List<ProfileReadingEntry> Defaults = new()
     {
-        new() { Priority = 1, ProfileObis = "1.0.99.3.0.255", TimeoutSeconds = 30, FallbackMaxHours = 24 },
+        new() { Priority = 1, ProfileObis = "1.0.99.3.0.255", TimeoutSeconds = 90, FallbackMaxHours = 24 },
         new() { Priority = 2, ProfileObis = "1.0.99.1.0.255", TimeoutSeconds = 60, FallbackMaxHours = 24 },
         new() { Priority = 3, ProfileObis = "1.0.99.2.0.255", TimeoutSeconds = 120, FallbackMaxHours = 12 },
         new() { Priority = 4, ProfileObis = "0.0.98.1.0.255", TimeoutSeconds = 20, FallbackMaxHours = 24 },
@@ -47,9 +48,14 @@ public class ProfileReadingConfig : IProfileReadingConfig
         _serviceProvider = serviceProvider;
         _logger = logger;
         _fallbackMaxHoursOverride = configuration.GetValue<int>("MultiPass:ProfileFallbackMaxHours", 0);
+        _maxProfilesToRead = configuration.GetValue<int>("MultiPass:MaxProfilesToRead", 8);
         if (_fallbackMaxHoursOverride > 0)
         {
             _logger.LogInformation("ProfileFallbackMaxHours override depuis appsettings: {Hours}h", _fallbackMaxHoursOverride);
+        }
+        if (_maxProfilesToRead != 8)
+        {
+            _logger.LogInformation("MaxProfilesToRead override depuis appsettings: {Max}", _maxProfilesToRead);
         }
     }
 
@@ -70,7 +76,7 @@ public class ProfileReadingConfig : IProfileReadingConfig
             if (configs.Count == 0)
             {
                 _logger.LogWarning("No ProfileReading config found in DB, using defaults");
-                _cached = ApplyFallbackOverride(Defaults.ToList());
+                _cached = ApplyFallbackOverride(Defaults.Take(_maxProfilesToRead).ToList());
                 return _cached;
             }
 
@@ -94,13 +100,20 @@ public class ProfileReadingConfig : IProfileReadingConfig
                 });
             }
 
-            _cached = ApplyFallbackOverride(result.OrderBy(r => r.Priority).ToList());
+            if (result.Count == 0)
+            {
+                _logger.LogWarning("ProfileReading config en base sans ProfilePriority_ — fallback aux defaults ({Count} profils)", Defaults.Count);
+                _cached = ApplyFallbackOverride(Defaults.Take(_maxProfilesToRead).ToList());
+                return _cached;
+            }
+
+            _cached = ApplyFallbackOverride(result.OrderBy(r => r.Priority).Take(_maxProfilesToRead).ToList());
             return _cached;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error loading ProfileReading config, using defaults");
-            _cached = ApplyFallbackOverride(Defaults.ToList());
+            _cached = ApplyFallbackOverride(Defaults.Take(_maxProfilesToRead).ToList());
             return _cached;
         }
     }

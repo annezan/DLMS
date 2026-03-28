@@ -81,15 +81,24 @@ public class ProfileReadingConfig : IProfileReadingConfig
             }
 
             var result = new List<ProfileReadingEntry>();
-            var priorityConfigs = configs.Where(c => c.Cle.StartsWith("ProfilePriority_")).OrderBy(c => c.Cle);
 
-            foreach (var pc in priorityConfigs)
+            // Format DB : profile.N.obis / profile.N.priority / profile.N.timeout_seconds / profile.N.fallback_hours
+            var obisConfigs = configs
+                .Where(c => c.Cle.EndsWith(".obis"))
+                .OrderBy(c => c.Cle)
+                .ToList();
+
+            foreach (var oc in obisConfigs)
             {
-                var obis = pc.Valeur;
-                var priorityNum = int.Parse(pc.Cle.Replace("ProfilePriority_", ""));
+                // profile.3.obis → prefix = "profile.3"
+                var prefix = oc.Cle[..oc.Cle.LastIndexOf('.')];
+                var obis = oc.Valeur;
 
-                var timeoutConfig = configs.FirstOrDefault(c => c.Cle == $"ProfileTimeout_{obis}");
-                var fallbackConfig = configs.FirstOrDefault(c => c.Cle == $"ProfileFallback_{obis}");
+                var priorityConfig = configs.FirstOrDefault(c => c.Cle == $"{prefix}.priority");
+                var timeoutConfig = configs.FirstOrDefault(c => c.Cle == $"{prefix}.timeout_seconds");
+                var fallbackConfig = configs.FirstOrDefault(c => c.Cle == $"{prefix}.fallback_hours");
+
+                var priorityNum = priorityConfig != null ? int.Parse(priorityConfig.Valeur) : 99;
 
                 result.Add(new ProfileReadingEntry
                 {
@@ -102,7 +111,7 @@ public class ProfileReadingConfig : IProfileReadingConfig
 
             if (result.Count == 0)
             {
-                _logger.LogWarning("ProfileReading config en base sans ProfilePriority_ — fallback aux defaults ({Count} profils)", Defaults.Count);
+                _logger.LogWarning("ProfileReading config en base sans profile.N.obis — fallback aux defaults ({Count} profils)", Defaults.Count);
                 _cached = ApplyFallbackOverride(Defaults.Take(_maxProfilesToRead).ToList());
                 return _cached;
             }

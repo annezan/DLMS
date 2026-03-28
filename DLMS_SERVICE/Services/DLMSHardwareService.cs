@@ -59,12 +59,12 @@ namespace DLMS_SERVICE.Services
     public class DLMSHardwareService : IDLMSHardwareService
     {
         private readonly ILogger<DLMSHardwareService> _logger;
-        private readonly IServiceProvider _serviceProvider;
+        private readonly IServiceScopeFactory _serviceScopeFactory;
         private const int BatchSize = 500;
-        public DLMSHardwareService(ILogger<DLMSHardwareService> logger, IServiceProvider serviceProvider)
+        public DLMSHardwareService(ILogger<DLMSHardwareService> logger, IServiceScopeFactory serviceScopeFactory)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-            _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
+            _serviceScopeFactory = serviceScopeFactory ?? throw new ArgumentNullException(nameof(serviceScopeFactory));
         }
 
         public async Task<DLMSReadResult> ReadInstantAsync(DLMSReadRequest request)
@@ -180,7 +180,7 @@ namespace DLMS_SERVICE.Services
         {
             try
             {
-                using var scope = _serviceProvider.CreateScope();
+                using var scope = _serviceScopeFactory.CreateScope();
                 var commandeCompteurRepo = scope.ServiceProvider.GetRequiredService<DLMS_DAL.CommandeCompteurDomainDal.Repositories.Commands.ICommandeCompteurCommandRepository>();
                 var commandeRepo = scope.ServiceProvider.GetRequiredService<DLMS_DAL.CommandeDomainDal.Repositories.Commands.ICommandeCommandRepository>();
 
@@ -213,7 +213,7 @@ namespace DLMS_SERVICE.Services
         {
             try
             {
-                using var scope = _serviceProvider.CreateScope();
+                using var scope = _serviceScopeFactory.CreateScope();
                 var commandeCompteurRepo = scope.ServiceProvider.GetRequiredService<DLMS_DAL.CommandeCompteurDomainDal.Repositories.Commands.ICommandeCompteurCommandRepository>();
 
                 // Archiver le CommandeCompteur après traitement réussi
@@ -236,7 +236,7 @@ namespace DLMS_SERVICE.Services
         {
             try
             {
-                using var scope = _serviceProvider.CreateScope();
+                using var scope = _serviceScopeFactory.CreateScope();
                 var context = scope.ServiceProvider.GetRequiredService<DLMSDBContext>();
 
                 var hasDetails = await context.Gxdlmsprofilgenericdetails
@@ -338,7 +338,7 @@ namespace DLMS_SERVICE.Services
                 };
 
                 // 🔥 CORRECTION: Créer un scope séparé pour chaque profil pour éviter la concurrence DbContext
-                using var scope = _serviceProvider.CreateScope();
+                using var scope = _serviceScopeFactory.CreateScope();
                 var context = scope.ServiceProvider.GetRequiredService<DLMSDBContext>();
                 
                 // 🔥 OPTIMISATION 1: Précharger tous les profils génériques avec leur CodeObis
@@ -406,7 +406,7 @@ namespace DLMS_SERVICE.Services
                         var profileLN = profiles[processedCount];
                         
                         // 🔥 CORRECTION: Créer un scope séparé pour chaque profil
-                        using var profileScope = _serviceProvider.CreateScope();
+                        using var profileScope = _serviceScopeFactory.CreateScope();
                         var profileContext = profileScope.ServiceProvider.GetRequiredService<DLMSDBContext>();
                         
                         // 🔥 OPTIMISATION 5: Utiliser le dictionnaire au lieu de la DB
@@ -419,13 +419,15 @@ namespace DLMS_SERVICE.Services
 
                         if (entry.Key.Length > 0 && entry.Value.Length > 0)
                         {
-                            DateTime dateUtc = DateTime.UtcNow;
+                            DateTime dateUtc = DateTime.MinValue;
+                            bool dateValid = false;
 
                             foreach (var row in entry.Key)
                             {
                                 if (row is IEnumerable<object> values)
                                 {
                                     var array = values.ToArray();
+                                    dateValid = false;
 
                                     for (int i = 0; i < entry.Value.Length; i++)
                                     {
@@ -443,18 +445,36 @@ namespace DLMS_SERVICE.Services
                                                 {
                                                     long unixTimestamp = ((DateTimeOffset)dateValue).ToUnixTimeSeconds();
                                                     dateUtc = DateTimeOffset.FromUnixTimeSeconds(unixTimestamp).UtcDateTime;
+                                                    dateValid = true;
                                                 }
                                                 else
                                                 {
-                                                    // Gérer le cas où la conversion échoue
-                                                    _logger.LogWarning("Format de date invalide: {Date}", array[i]);
-                                                    continue;
+                                                    _logger.LogWarning("Format de date invalide pour {Serial}: {Date} — ligne ignorée", serialNumber, array[i]);
+                                                    break; // Skip entire row
                                                 }
-
                                             }
 
-                                            detailprofil.Value = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
-                                            detailprofil.CodeObisId = codeObisDict.TryGetValue(objStr, out var codeObis) ? codeObis.Id : 0;
+                                            if (!dateValid) continue;
+
+                                            var rawStr = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
+                                            detailprofil.RawValue = rawStr;
+                                            if (isRegisterValue)
+                                            {
+                                                var factor = GetDisplayConversionFactor(objStr);
+                                                var converted = Convert.ToDecimal(realValue) * (decimal)factor;
+                                                detailprofil.Value = Math.Round(converted, 1).ToString();
+                                            }
+                                            else
+                                            {
+                                                detailprofil.Value = rawStr;
+                                            }
+                                            var resolvedCodeObisId = codeObisDict.TryGetValue(objStr, out var codeObis) ? codeObis.Id : 0;
+                                            if (resolvedCodeObisId == 0)
+                                            {
+                                                _logger.LogWarning("CodeObis inconnu '{Obis}' pour {Serial} — ligne ignorée", objStr, serialNumber);
+                                                continue;
+                                            }
+                                            detailprofil.CodeObisId = resolvedCodeObisId;
                                             detailprofil.DateEnr = dateUtc;
                                             detailprofil.GxdlmsprofilgenericId = profilGeneric.Id;
                                             detailprofil.NumeroCompteur = serialNumber;
@@ -488,10 +508,12 @@ namespace DLMS_SERVICE.Services
                                                     detailprofilevent.EventId = null;
                                                 }
                                                 detailprofilevent.Value = array[i]?.ToString() ?? string.Empty;
+                                                detailprofilevent.RawValue = detailprofilevent.Value;
                                             }
                                             else
                                             {
                                                 detailprofilevent.Value = array[i]?.ToString() ?? string.Empty;
+                                                detailprofilevent.RawValue = detailprofilevent.Value;
                                                 detailprofilevent.EventId = null;
                                             }
 
@@ -528,104 +550,52 @@ namespace DLMS_SERVICE.Services
                             }
                         }
 
-                        // 🔥 OPTIMISATION 6: Sauvegarde par profil avec AddRangeAsync
+                        // BulkInsertOrUpdate — élimine les race conditions (duplicate key)
                         if (detailsToAdd.Any())
                         {
-                            // 🔥 OPTIMISATION: Approche par plage de dates (ChatGPT)
-                            // Récupérer seulement les candidats avec index
-                            if (detailsToAdd.Any())
+                            await profileContext.BulkInsertOrUpdateAsync(detailsToAdd, new BulkConfig
                             {
-                                var minDate = detailsToAdd.Min(x => x.DateEnr);
-                                var maxDate = detailsToAdd.Max(x => x.DateEnr);
-
-                                var existingDetails = await profileContext.Gxdlmsprofilgenericdetails
-                                    .AsNoTracking()
-                                    .Where(x =>
-                                        x.NumeroCompteur == serialNumber &&
-                                        x.GxdlmsprofilgenericId == profilGeneric.Id &&
-                                        x.DateEnr >= minDate &&
-                                        x.DateEnr <= maxDate)
-                                    .Select(x => new
-                                    {
-                                        x.Value,
-                                        x.DateEnr,
-                                        x.GxdlmsprofilgenericId,
-                                        x.NumeroCompteur,
-                                        x.CodeObisId
-                                    })
-                                    .ToListAsync();
-
-                                // HashSet en mémoire pour filtrage rapide
-                                var existingKeysSet = new HashSet<string>(
-                                    existingDetails.Select(e =>
-                                        $"{e.Value}_{e.DateEnr:yyyy-MM-dd HH:mm:ss.fffffff}_{e.GxdlmsprofilgenericId}_{e.NumeroCompteur}_{e.CodeObisId}"
-                                    ));
-
-                                var detailsToInsert = detailsToAdd
-                                    .Where(d => !existingKeysSet.Contains(
-                                        $"{d.Value}_{d.DateEnr:yyyy-MM-dd HH:mm:ss.fffffff}_{d.GxdlmsprofilgenericId}_{d.NumeroCompteur}_{d.CodeObisId}"
-                                    ))
-                                    .ToList();
-
-                                if (detailsToInsert.Any())
+                                SetOutputIdentity = false,
+                                BatchSize = BatchSize,
+                                UpdateByProperties = new List<string>
                                 {
-                                    await profileContext.Gxdlmsprofilgenericdetails.AddRangeAsync(detailsToInsert);
-                                    await profileContext.SaveChangesAsync();
+                                    nameof(Gxdlmsprofilgenericdetail.NumeroCompteur),
+                                    nameof(Gxdlmsprofilgenericdetail.GxdlmsprofilgenericId),
+                                    nameof(Gxdlmsprofilgenericdetail.CodeObisId),
+                                    nameof(Gxdlmsprofilgenericdetail.DateEnr)
+                                },
+                                PropertiesToExcludeOnUpdate = new List<string>
+                                {
+                                    nameof(Gxdlmsprofilgenericdetail.Value),
+                                    nameof(Gxdlmsprofilgenericdetail.RawValue),
+                                    nameof(Gxdlmsprofilgenericdetail.IsArchive)
                                 }
-                                profileContext.ChangeTracker.Clear();
-                                detailsToAdd.Clear();
-                            }
+                            });
+                            detailsToAdd.Clear();
                         }
                         if (eventsToAdd.Any())
                         {
-                            // 🔥 OPTIMISATION: Approche par plage de dates (ChatGPT) pour les événements
-                            var minEventDate = eventsToAdd.Min(x => x.DateEnr);
-                            var maxEventDate = eventsToAdd.Max(x => x.DateEnr);
-
-                            var existingEvents = await profileContext.Gxdlmsprofilgenericdetailsevents
-                                .AsNoTracking()
-                                .Where(x =>
-                                    x.NumeroCompteur == serialNumber &&
-                                    x.GxdlmsprofilgenericId == profilGeneric.Id &&
-                                    x.DateEnr >= minEventDate &&
-                                    x.DateEnr <= maxEventDate)
-                                .Select(x => new
-                                {
-                                    x.Value,
-                                    x.DateEnr,
-                                    x.GxdlmsprofilgenericId,
-                                    x.NumeroCompteur,
-                                    x.CodeObisId,
-                                    x.EventId
-                                })
-                                .ToListAsync();
-
-                            // HashSet en mémoire pour filtrage rapide
-                            var existingEventsKeysSet = new HashSet<string>(
-                                existingEvents.Select(e =>
-                                    $"{e.Value}_{e.DateEnr:yyyy-MM-dd HH:mm:ss.fffffff}_{e.GxdlmsprofilgenericId}_{e.NumeroCompteur}_{e.CodeObisId}_{e.EventId}"
-                                ));
-
-                            var eventsToInsert = eventsToAdd
-                                .Where(e => !existingEventsKeysSet.Contains(
-                                    $"{e.Value}_{e.DateEnr:yyyy-MM-dd HH:mm:ss.fffffff}_{e.GxdlmsprofilgenericId}_{e.NumeroCompteur}_{e.CodeObisId}_{e.EventId}"
-                                ))
-                                .ToList();
-
-                            if (eventsToInsert.Any())
+                            await profileContext.BulkInsertOrUpdateAsync(eventsToAdd, new BulkConfig
                             {
-                                await profileContext.Gxdlmsprofilgenericdetailsevents.AddRangeAsync(eventsToInsert);
-                                await profileContext.SaveChangesAsync();
-                            }
-                            profileContext.ChangeTracker.Clear();
+                                SetOutputIdentity = false,
+                                BatchSize = BatchSize,
+                                UpdateByProperties = new List<string>
+                                {
+                                    nameof(Gxdlmsprofilgenericdetailsevent.NumeroCompteur),
+                                    nameof(Gxdlmsprofilgenericdetailsevent.GxdlmsprofilgenericId),
+                                    nameof(Gxdlmsprofilgenericdetailsevent.CodeObisId),
+                                    nameof(Gxdlmsprofilgenericdetailsevent.DateEnr)
+                                },
+                                PropertiesToExcludeOnUpdate = new List<string>
+                                {
+                                    nameof(Gxdlmsprofilgenericdetailsevent.Value),
+                                    nameof(Gxdlmsprofilgenericdetailsevent.RawValue),
+                                    nameof(Gxdlmsprofilgenericdetailsevent.IsArchive),
+                                    nameof(Gxdlmsprofilgenericdetailsevent.EventId)
+                                }
+                            });
                             eventsToAdd.Clear();
                         }
-
-                        // 🔥 OPTIMISATION 7: Plus besoin de sauvegarder ici - déjà fait par profil
-
-                        // 🔥 OPTIMISATION 7: Réactiver le tracking EF
-                        profileContext.ChangeTracker.AutoDetectChangesEnabled = true;
-                        profileContext.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.TrackAll;
 
                        // _logger.LogInformation("Profil traité et enregistré: {Processed} entrées pour {SerialNumber}", processedCount + 1, serialNumber);
                     }
@@ -663,7 +633,7 @@ namespace DLMS_SERVICE.Services
                     return 0;
                 }
 
-                using var scope = _serviceProvider.CreateScope();
+                using var scope = _serviceScopeFactory.CreateScope();
                 var context = scope.ServiceProvider.GetRequiredService<DLMSDBContext>();
 
                 // Lookup profile generic via Join on CodeObis
@@ -775,7 +745,18 @@ namespace DLMS_SERVICE.Services
                                     }
                                     bool isRegisterValue = realValue is decimal || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
 
-                                    detailprofil.Value = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
+                                    var rawStr = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
+                                    detailprofil.RawValue = rawStr;
+                                    if (isRegisterValue)
+                                    {
+                                        var factor = GetDisplayConversionFactor(objStr);
+                                        var converted = Convert.ToDecimal(realValue) * (decimal)factor;
+                                        detailprofil.Value = Math.Round(converted, 1).ToString();
+                                    }
+                                    else
+                                    {
+                                        detailprofil.Value = rawStr;
+                                    }
                                     detailprofil.CodeObisId = codeObisDict.TryGetValue(objStr, out var codeObis) ? codeObis.Id : 0;
                                     detailprofil.DateEnr = dateUtc;
                                     detailprofil.GxdlmsprofilgenericId = profilGeneric.Id;
@@ -808,10 +789,12 @@ namespace DLMS_SERVICE.Services
                                             detailprofilevent.EventId = null;
                                         }
                                         detailprofilevent.Value = array[i]?.ToString() ?? string.Empty;
+                                        detailprofilevent.RawValue = detailprofilevent.Value;
                                     }
                                     else
                                     {
                                         detailprofilevent.Value = array[i]?.ToString() ?? string.Empty;
+                                        detailprofilevent.RawValue = detailprofilevent.Value;
                                         detailprofilevent.EventId = null;
                                     }
 
@@ -846,6 +829,7 @@ namespace DLMS_SERVICE.Services
                         PropertiesToExcludeOnUpdate = new List<string>
                         {
                             nameof(Gxdlmsprofilgenericdetail.Value),
+                            nameof(Gxdlmsprofilgenericdetail.RawValue),
                             nameof(Gxdlmsprofilgenericdetail.IsArchive)
                         }
                     });
@@ -866,6 +850,7 @@ namespace DLMS_SERVICE.Services
                         PropertiesToExcludeOnUpdate = new List<string>
                         {
                             nameof(Gxdlmsprofilgenericdetailsevent.Value),
+                            nameof(Gxdlmsprofilgenericdetailsevent.RawValue),
                             nameof(Gxdlmsprofilgenericdetailsevent.IsArchive),
                             nameof(Gxdlmsprofilgenericdetailsevent.EventId)
                         }
@@ -945,7 +930,7 @@ namespace DLMS_SERVICE.Services
         {
             try
             {
-                using var scope = _serviceProvider.CreateScope();
+                using var scope = _serviceScopeFactory.CreateScope();
                 var context = scope.ServiceProvider.GetRequiredService<DLMSDBContext>();
 
                 var commandeCompteur = await context.CommandeCompteur
@@ -990,7 +975,7 @@ namespace DLMS_SERVICE.Services
                 };
 
                 // Créer un scope séparé pour chaque profil pour éviter la concurrence DbContext
-                using var scope = _serviceProvider.CreateScope();
+                using var scope = _serviceScopeFactory.CreateScope();
                 var context = scope.ServiceProvider.GetRequiredService<DLMSDBContext>();
                 
                 // Précharger tous les profils génériques avec leur CodeObis
@@ -1032,7 +1017,7 @@ namespace DLMS_SERVICE.Services
                         var profileLN = profiles[processedCount];
                         
                         // Créer un scope séparé pour chaque profil
-                        using var profileScope = _serviceProvider.CreateScope();
+                        using var profileScope = _serviceScopeFactory.CreateScope();
                         var profileContext = profileScope.ServiceProvider.GetRequiredService<DLMSDBContext>();
                         
                         // Utiliser le dictionnaire au lieu de la DB
@@ -1168,7 +1153,7 @@ namespace DLMS_SERVICE.Services
         {
             try
             {
-                using var scope = _serviceProvider.CreateScope();
+                using var scope = _serviceScopeFactory.CreateScope();
                 var context = scope.ServiceProvider.GetRequiredService<DLMSDBContext>();
                 var commandeRepo = scope.ServiceProvider.GetRequiredService<DLMS_DAL.CommandeDomainDal.Repositories.Commands.ICommandeCommandRepository>();
 
@@ -1228,7 +1213,7 @@ namespace DLMS_SERVICE.Services
         {
             try
             {
-                using var archiveScope = _serviceProvider.CreateScope();
+                using var archiveScope = _serviceScopeFactory.CreateScope();
                 var commandeCompteurRepo = archiveScope.ServiceProvider.GetRequiredService<DLMS_DAL.CommandeCompteurDomainDal.Repositories.Commands.ICommandeCompteurCommandRepository>();
 
                 var commandeCompteurToArchive = new CommandeCompteur
@@ -1248,5 +1233,30 @@ namespace DLMS_SERVICE.Services
         }
 
 
+        /// <summary>
+        /// Facteur de conversion d'affichage : ÷1000 pour énergie (Wh→kWh) et puissance (W→kW),
+        /// ×1 pour tension, courant, fréquence, angle.
+        /// </summary>
+        private static double GetDisplayConversionFactor(string obisCode)
+        {
+            var parts = obisCode.Split('.');
+            if (parts.Length < 6) return 1.0;
+            if (!int.TryParse(parts[3], out int d)) return 1.0;
+
+            // D=8 (énergie) : Wh→kWh, varh→kvarh
+            if (d == 8) return 0.001;
+
+            // D=7 (puissance) : selon le type de mesure
+            if (d == 7 && int.TryParse(parts[2], out int c))
+            {
+                if (c == 31 || c == 51 || c == 71) return 1.0; // Courant (A)
+                if (c == 32 || c == 52 || c == 72) return 1.0; // Tension (V)
+                if (c == 14) return 1.0; // Fréquence (Hz)
+                if (c == 81) return 1.0; // Angle (°)
+                return 0.001; // Puissance active/réactive W→kW, var→kvar
+            }
+
+            return 1.0;
+        }
      }
 }

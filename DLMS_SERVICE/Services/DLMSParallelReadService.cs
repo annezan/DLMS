@@ -15,6 +15,7 @@ using DLMS_SERVICE.Services.MultiPass;
 using DLMS_DAL.ReadingDomainDal.Repositories.Queries;
 using DLMS_DAL.ReadingDomainDal.Repositories.Commands;
 using DLMS_MODELS.ReadingDomain.Entities;
+using Microsoft.Extensions.Options;
 
 namespace DLMS_SERVICE.Services
 {
@@ -55,6 +56,7 @@ namespace DLMS_SERVICE.Services
         private readonly IDLMSMetricsService _metricsService;
         private readonly IMeterHealthTracker _healthTracker;
         private readonly IProfileReadingConfig _profileConfig;
+        private readonly MultiPassConfig _multiPassConfig;
         private readonly TimeSpan _readTimeout = TimeSpan.FromMinutes(3);
 
         public DLMSParallelReadService(
@@ -66,7 +68,8 @@ namespace DLMS_SERVICE.Services
             IServiceProvider serviceProvider,
             IDLMSMetricsService metricsService,
             IMeterHealthTracker healthTracker,
-            IProfileReadingConfig profileConfig)
+            IProfileReadingConfig profileConfig,
+            IOptions<MultiPassConfig> multiPassOptions)
         {
             _sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
             _keyService = keyService ?? throw new ArgumentNullException(nameof(keyService));
@@ -77,6 +80,7 @@ namespace DLMS_SERVICE.Services
             _metricsService = metricsService ?? throw new ArgumentNullException(nameof(metricsService));
             _healthTracker = healthTracker ?? throw new ArgumentNullException(nameof(healthTracker));
             _profileConfig = profileConfig ?? throw new ArgumentNullException(nameof(profileConfig));
+            _multiPassConfig = multiPassOptions?.Value ?? throw new ArgumentNullException(nameof(multiPassOptions));
         }
 
         public async Task ProcessUmadGroupAsync(
@@ -1042,7 +1046,8 @@ namespace DLMS_SERVICE.Services
                 Password = keys.Password,
                 AuthenticationKey = keys.AuthenticationKey,
                 UnicastKey = keys.UnicastKey,
-                InterfaceType = "HDLC"
+                InterfaceType = "HDLC",
+                UseGbt = true
             };
 
             // ===============================
@@ -1106,6 +1111,28 @@ namespace DLMS_SERVICE.Services
                 
                 _logger.LogInformation("⏱️ Lecture compteur {Serial} terminée en {ElapsedMs}ms", serial, readStopwatch.ElapsedMilliseconds);
                 
+                if (!readResult.Success && readResult.ErrorMessage?.Contains("Cles DLMS") != true)
+                {
+                    // Retry : reconnexion HDLC + re-lecture
+                    _logger.LogInformation("Retry lecture UMAD {Serial} apres echec: {Error}", serial, readResult.ErrorMessage);
+                    try
+                    {
+                        session.Reader?.Disconnect();
+                        session.AssociationLoaded = false;
+                        session.InitializeMeterClient(meterParams, waitTime: 5000, retryCount: 2);
+                        await Task.Run(() => session.Reader!.InitializeConnection(), combinedCts.Token);
+
+                        readStopwatch = System.Diagnostics.Stopwatch.StartNew();
+                        readResult = await ReadCompteurDataAsync(session, meter, combinedCts.Token);
+                        readStopwatch.Stop();
+                        _logger.LogInformation("Retry lecture UMAD {Serial}: {Result}", serial, readResult.Success ? "OK" : readResult.ErrorMessage);
+                    }
+                    catch (Exception retryEx)
+                    {
+                        _logger.LogWarning(retryEx, "Retry UMAD echoue pour {Serial}", serial);
+                    }
+                }
+
                 if (!readResult.Success)
                 {
                     _logger.LogWarning("⚠️ Lecture échouée {Serial}: {Error}", serial, readResult.ErrorMessage);
@@ -1282,7 +1309,8 @@ namespace DLMS_SERVICE.Services
         {
             var results = new List<ProfileReadResult>();
             var profiles = await _profileConfig.GetOrderedProfilesAsync();
-            var now = DateTime.Now;
+            var now = DateTime.UtcNow;
+            var globalMaxLookback = now.AddHours(-_multiPassConfig.ProfileReadHours);
             var profileSw = System.Diagnostics.Stopwatch.StartNew();
 
             // Budget-awareness : si le budget est serré, ne lire que les profils essentiels (priorité 1-3)
@@ -1293,7 +1321,7 @@ namespace DLMS_SERVICE.Services
             if (budgetTight)
             {
                 profiles = profiles.Where(p => p.Priority <= EssentialMaxPriority).ToList();
-                _logger.LogDebug("Budget serre ({BudgetLeft}s) pour {Serial} — lecture profils essentiels uniquement ({Count} profils)",
+                _logger.LogInformation("Budget serre ({BudgetLeft}s) pour {Serial} — lecture profils essentiels uniquement ({Count} profils)",
                     budgetSecondsLeft, serial, profiles.Count);
             }
 
@@ -1316,7 +1344,7 @@ namespace DLMS_SERVICE.Services
                     var remaining = budgetSecondsLeft - elapsed;
                     if (remaining < 15)
                     {
-                        _logger.LogDebug("Budget profils epuise pour {Serial} apres {Elapsed}s — skip des profils restants",
+                        _logger.LogInformation("Budget profils epuise pour {Serial} apres {Elapsed}s — skip des profils restants",
                             serial, elapsed);
                         break;
                     }
@@ -1330,6 +1358,7 @@ namespace DLMS_SERVICE.Services
                     // Calculate incremental date range
                     var history = histories.FirstOrDefault(h => h.ProfileObis == profile.ProfileObis);
                     var fallbackLimit = now.AddHours(-profile.FallbackMaxHours);
+                    if (fallbackLimit < globalMaxLookback) fallbackLimit = globalMaxLookback;
 
                     DateTime dateStart;
                     if (history != null)
@@ -1365,7 +1394,7 @@ namespace DLMS_SERVICE.Services
                     // Skip if nothing new
                     if (dateStart >= dateEnd)
                     {
-                        _logger.LogDebug("Skip {Obis} pour {Serial}: rien de nouveau ({Start} >= {End})",
+                        _logger.LogInformation("Skip profil {Obis} pour {Serial}: rien de nouveau (derniere lecture {Start} >= borne {End})",
                             profile.ProfileObis, serial, dateStart, dateEnd);
                         profileResult.Success = true;
                         profileResult.RowsRead = 0;

@@ -290,18 +290,18 @@ namespace DLMS_SERVICE.Services
                         break;
                 }
 
-                job.CompletedAt = DateTime.Now;
                 stopwatch.Stop();
-                
-                _logger.LogInformation("✅ Job {JobType} terminé en {ElapsedMs}ms pour {IP}:{Port}", 
+                _jobQueue.MarkJobCompleted(job);
+
+                _logger.LogInformation("✅ Job {JobType} terminé en {ElapsedMs}ms pour {IP}:{Port}",
                     job.Type, stopwatch.ElapsedMilliseconds, job.IP, job.Port);
             }
             catch (Exception ex)
             {
                 stopwatch.Stop();
-                job.CompletedAt = DateTime.Now;
-                
-                _logger.LogError(ex, "❌ Échec job {JobType} pour {IP}:{Port} après {ElapsedMs}ms", 
+                _jobQueue.MarkJobCompleted(job);
+
+                _logger.LogError(ex, "❌ Échec job {JobType} pour {IP}:{Port} après {ElapsedMs}ms",
                     job.Type, job.IP, job.Port, stopwatch.ElapsedMilliseconds);
             }
         }

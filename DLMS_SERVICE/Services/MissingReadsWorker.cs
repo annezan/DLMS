@@ -11,15 +11,18 @@ namespace DLMS_SERVICE.Services
         private readonly IServiceProvider _serviceProvider;
         private readonly TimeSpan _checkInterval = TimeSpan.FromMinutes(1); // Vérification toutes les minutes
         private readonly IIPWorkerService _workerService;
+        private readonly IIPJobQueue _jobQueue;
 
         public MissingReadsWorker(
             ILogger<MissingReadsWorker> logger,
             IServiceProvider serviceProvider,
-            IIPWorkerService workerService)
+            IIPWorkerService workerService,
+            IIPJobQueue jobQueue)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
             _workerService = workerService ?? throw new ArgumentNullException(nameof(workerService));
+            _jobQueue = jobQueue ?? throw new ArgumentNullException(nameof(jobQueue));
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -80,12 +83,30 @@ namespace DLMS_SERVICE.Services
                     return;
                 }
 
-                _logger.LogInformation("🔍 Enqueue de {Count} lectures de rattrapage", missingReads.Count);
+                // Exclure les compteurs déjà en queue ou en cours de traitement
+                var pendingSerials = _jobQueue.GetPendingMissingSerials();
+                var filteredReads = missingReads
+                    .Where(m => !pendingSerials.Contains(m.NumeroCompteur))
+                    .ToList();
+
+                var excluded = missingReads.Count - filteredReads.Count;
+                if (excluded > 0)
+                {
+                    _logger.LogInformation("⏭️ {Excluded}/{Total} lectures exclues (déjà en queue/cours)", excluded, missingReads.Count);
+                }
+
+                if (filteredReads.Count == 0)
+                {
+                    _logger.LogInformation("✅ Toutes les lectures manquantes sont déjà en cours de traitement");
+                    return;
+                }
+
+                _logger.LogInformation("🔍 Enqueue de {Count} lectures de rattrapage", filteredReads.Count);
 
                 // Envoyer les lectures manquantes dans la queue prioritaire
-                await _workerService.EnqueueMissingReadsAsync(missingReads);
-                
-                _logger.LogInformation("✅ {Count} lectures de rattrapage en queue avec priorité", missingReads.Count);
+                await _workerService.EnqueueMissingReadsAsync(filteredReads);
+
+                _logger.LogInformation("✅ {Count} lectures de rattrapage en queue avec priorité", filteredReads.Count);
             }
             catch (Exception ex)
             {

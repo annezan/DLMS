@@ -35,12 +35,15 @@ namespace DLMS_SERVICE.Services
         Task<DLMSJob> DequeueAsync(string ip, int port, CancellationToken ct);
         Task<int> GetQueueCountAsync(string ip, int port);
         Task<List<DLMSJob>> GetAllQueuesStatusAsync();
+        HashSet<string> GetPendingMissingSerials();
+        void MarkJobCompleted(DLMSJob job);
     }
 
     public class IPJobQueue : IIPJobQueue
     {
         private readonly ConcurrentDictionary<string, PriorityQueue<DLMSJob, int>> _queues = new();
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _queueLocks = new();
+        private readonly ConcurrentDictionary<string, byte> _pendingMissingKeys = new();
         private readonly ILogger<IPJobQueue> _logger;
 
         public IPJobQueue(ILogger<IPJobQueue> logger)
@@ -53,24 +56,64 @@ namespace DLMS_SERVICE.Services
             return $"{ip}:{port}";
         }
 
+        private static string GetMissingJobDedupKey(DLMSJob job)
+        {
+            if (job.Type != JobType.Missing || job.MissingReads == null) return "";
+            var serials = string.Join(",", job.MissingReads.Select(m => m.NumeroCompteur).Distinct().OrderBy(s => s));
+            return $"missing_{job.IP}:{job.Port}_{serials}";
+        }
+
         public async Task EnqueueAsync(DLMSJob job)
         {
             var queueKey = GetQueueKey(job.IP, job.Port);
             var queueLock = _queueLocks.GetOrAdd(queueKey, _ => new SemaphoreSlim(1, 1));
+
+            // Dedup pour les jobs Missing : ne pas re-enqueuer si un job identique est déjà en queue/en cours
+            if (job.Type == JobType.Missing)
+            {
+                var dedupKey = GetMissingJobDedupKey(job);
+                if (!string.IsNullOrEmpty(dedupKey) && !_pendingMissingKeys.TryAdd(dedupKey, 0))
+                {
+                    _logger.LogDebug("⏭️ Job Missing déjà en queue/cours pour {QueueKey} — ignoré", queueKey);
+                    return;
+                }
+            }
 
             await queueLock.WaitAsync();
             try
             {
                 var queue = _queues.GetOrAdd(queueKey, _ => new PriorityQueue<DLMSJob, int>());
                 queue.Enqueue(job, (int)job.Type);
-                
-                _logger.LogDebug("📦 Job {JobId} de type {JobType} ajouté à la queue {QueueKey} (priorité: {Priority})", 
+
+                _logger.LogDebug("📦 Job {JobId} de type {JobType} ajouté à la queue {QueueKey} (priorité: {Priority})",
                     job.Id, job.Type, queueKey, (int)job.Type);
             }
             finally
             {
                 queueLock.Release();
             }
+        }
+
+        public void MarkJobCompleted(DLMSJob job)
+        {
+            if (job.Type == JobType.Missing)
+            {
+                var dedupKey = GetMissingJobDedupKey(job);
+                if (!string.IsNullOrEmpty(dedupKey))
+                    _pendingMissingKeys.TryRemove(dedupKey, out _);
+            }
+            job.CompletedAt = DateTime.Now;
+        }
+
+        public HashSet<string> GetPendingMissingSerials()
+        {
+            return _pendingMissingKeys.Keys
+                .SelectMany(k =>
+                {
+                    var parts = k.Split('_');
+                    return parts.Length >= 3 ? parts[2].Split(',') : Array.Empty<string>();
+                })
+                .ToHashSet();
         }
 
         public async Task<DLMSJob> DequeueAsync(string ip, int port, CancellationToken ct)
@@ -85,13 +128,13 @@ namespace DLMS_SERVICE.Services
                 {
                     var job = queue.Dequeue();
                     job.StartedAt = DateTime.Now;
-                    
-                    _logger.LogDebug("🎯 Job {JobId} de type {JobType} retiré de la queue {QueueKey}", 
+
+                    _logger.LogDebug("🎯 Job {JobId} de type {JobType} retiré de la queue {QueueKey}",
                         job.Id, job.Type, queueKey);
-                    
+
                     return job;
                 }
-                
+
                 return null;
             }
             finally
@@ -119,12 +162,12 @@ namespace DLMS_SERVICE.Services
         public async Task<List<DLMSJob>> GetAllQueuesStatusAsync()
         {
             var status = new List<DLMSJob>();
-            
+
             foreach (var queueLock in _queueLocks.Values)
             {
                 await queueLock.WaitAsync();
             }
-            
+
             try
             {
                 foreach (var kvp in _queues)
@@ -140,7 +183,7 @@ namespace DLMS_SERVICE.Services
                     queueLock.Release();
                 }
             }
-            
+
             return status;
         }
     }

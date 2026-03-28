@@ -19,6 +19,7 @@ public class MeterReadOutcome
     public int TimeoutApplied { get; set; }
     public MeterReadingResult ResultCategory { get; set; } = MeterReadingResult.NonTraite;
     public List<ProfileReadResult> ProfileResults { get; set; } = new();
+    public int ProfilesInserted => ProfileResults.Where(p => p.Success).Sum(p => p.RowsRead);
 }
 
 public class ProfileReadResult
@@ -44,6 +45,7 @@ public class PassResult
     public int Failed => Results.Count(r => !r.Success);
     public int DeferredCount => DeferredMeters.Count;
     public int InScope => Results.Count + DeferredCount;
+    public int TotalProfilesInserted => Results.Sum(r => r.ProfilesInserted);
 
     public void DeferIp(string ipKey) => DeferredIps.TryAdd(ipKey, 0);
     public void DeferMeter(CompteurEquipement m) => DeferredMeters.Add(m);

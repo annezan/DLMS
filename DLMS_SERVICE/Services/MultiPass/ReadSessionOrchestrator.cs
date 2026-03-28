@@ -94,8 +94,8 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
                     .ToList();
 
                 _logger.LogInformation(
-                    "=== PASS 1 TERMINE ({Duration:F1} min) — {OK} lus, {Failed} echoues, {Deferred} differes ===",
-                    passResult.ElapsedMs / 60000.0, passResult.Succeeded, passResult.Failed, passResult.DeferredCount);
+                    "=== PASS 1 TERMINE ({Duration:F1} min) — {OK} lus, {Failed} echoues, {Deferred} differes, {Profiles} lignes profils persistees ===",
+                    passResult.ElapsedMs / 60000.0, passResult.Succeeded, passResult.Failed, passResult.DeferredCount, passResult.TotalProfilesInserted);
 
                 // Pause adaptative avant rescue
                 if (currentMeters.Count > 0)
@@ -140,8 +140,8 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
                     .ToList();
 
                 _logger.LogInformation(
-                    "=== RESCUE TERMINE ({Duration:F1} min) — {OK} lus, {Failed} echoues ===",
-                    rescueResult.ElapsedMs / 60000.0, rescueResult.Succeeded, rescueResult.Failed);
+                    "=== RESCUE TERMINE ({Duration:F1} min) — {OK} lus, {Failed} echoues, {Profiles} lignes profils persistees ===",
+                    rescueResult.ElapsedMs / 60000.0, rescueResult.Succeeded, rescueResult.Failed, rescueResult.TotalProfilesInserted);
             }
             else
             {
@@ -194,10 +194,11 @@ public class ReadSessionOrchestrator : IReadSessionOrchestrator
         var accessibleIps = report.AllResults.Select(r => $"{r.Ip}:{r.Port}").Distinct();
         report.IpsAccessibles = accessibleIps.Count();
 
+        var totalProfiles = report.Passes.Sum(p => p.TotalProfilesInserted);
         _logger.LogInformation(
-            "=== FIN SESSION #{SessionNumber} — {OK}/{Total} lus ({Rate:F1}%) en {Duration:F1} min ===",
+            "=== FIN SESSION #{SessionNumber} — {OK}/{Total} lus ({Rate:F1}%), {Profiles} lignes profils persistees, en {Duration:F1} min ===",
             sessionNumber, report.TotalSucceeded, report.TotalMetersInScope,
-            report.TauxReussite, report.TotalElapsedMs / 60000.0);
+            report.TauxReussite, totalProfiles, report.TotalElapsedMs / 60000.0);
 
         return report;
     }

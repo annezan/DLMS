@@ -441,15 +441,25 @@ namespace DLMS_SERVICE.Services
                                             bool isRegisterValue = realValue is decimal || realValue is double || realValue is float || realValue is int || realValue is long || realValue is Int64 || realValue is Int32;
                                             if (i == 0)
                                             {
-                                                if (DateTime.TryParse(array[i].ToString(), out DateTime dateValue))
+                                                var dateStr = array[i]?.ToString() ?? "";
+                                                if (string.IsNullOrEmpty(dateStr) || dateStr == "[]")
+                                                {
+                                                    break; // Séparateur inter-profil, skip silencieusement
+                                                }
+                                                else if (DateTime.TryParse(dateStr, out DateTime dateValue))
                                                 {
                                                     long unixTimestamp = ((DateTimeOffset)dateValue).ToUnixTimeSeconds();
                                                     dateUtc = DateTimeOffset.FromUnixTimeSeconds(unixTimestamp).UtcDateTime;
                                                     dateValid = true;
                                                 }
+                                                else if (long.TryParse(dateStr, out long unixTs) && unixTs > 946684800)
+                                                {
+                                                    dateUtc = DateTimeOffset.FromUnixTimeSeconds(unixTs).UtcDateTime;
+                                                    dateValid = true;
+                                                }
                                                 else
                                                 {
-                                                    _logger.LogWarning("Format de date invalide pour {Serial}: {Date} — ligne ignorée", serialNumber, array[i]);
+                                                    _logger.LogWarning("Format de date invalide pour {Serial}: {Date} — ligne ignorée", serialNumber, dateStr);
                                                     break; // Skip entire row
                                                 }
                                             }

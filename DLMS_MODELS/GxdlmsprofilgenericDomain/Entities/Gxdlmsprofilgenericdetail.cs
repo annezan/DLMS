@@ -13,7 +13,8 @@ public partial class Gxdlmsprofilgenericdetail
 
     public int GxdlmsprofilgenericId { get; set; }
     public string Value { get; set; } = null!;
-    
+    public string? RawValue { get; set; }
+
     public string NumeroCompteur { get; set; }
     public DateTime? DateEnr { get; set; }
     public bool? IsArchive { get; set; }

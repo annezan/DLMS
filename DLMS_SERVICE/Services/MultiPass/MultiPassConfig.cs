@@ -9,6 +9,8 @@ public class MultiPassConfig
     public int PacingDelayMs { get; set; } = 200;
     public int TcpScanTimeoutSeconds { get; set; } = 15;
     public int ProfileFallbackMaxHours { get; set; } = 24;
+    public int MaxProfilesToRead { get; set; } = 8;
+    public int ProfileReadHours { get; set; } = 24;
     public List<PassConfig> Passes { get; set; } = new();
 }
 

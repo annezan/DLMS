@@ -20,9 +20,9 @@ namespace DLMS_UTILITIES
                 return await _CompteurEquipementQueryRepository.GetCompteurEquipement();
 
             }
-            catch (Exception ex) 
+            catch (Exception ex)
             {
-                throw new Exception();
+                throw;
             }
         }
 

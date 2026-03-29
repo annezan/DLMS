@@ -103,7 +103,7 @@ class ProfileReadResult
     public string? RawData { get; set; }
     public string[]? Columns { get; set; }
     public List<object[]>? RowsRaw { get; set; }
-    public List<object[]>? RowsScaled { get; set; }
+    public List<object[]>? RowsConverted { get; set; }
     public List<object[]>? RowsWithTcTt { get; set; }
 }
 
@@ -1974,7 +1974,7 @@ class Program
     {
         ("1.0.99.1.0.255", "Load Profile 1 (horaire)", 60),
         ("1.0.99.2.0.255", "Load Profile 2 (5 min)", 120),
-        ("1.0.99.3.0.255", "Load Profile 3 (journalier)", 30),
+        ("1.0.99.3.0.255", "Load Profile 3 (journalier)", 90),
         ("0.0.98.1.0.255", "Billing Profile", 20),
         ("0.0.99.98.0.255", "Event Log 0", 20),
         ("0.0.99.98.1.255", "Event Log 1", 20),
@@ -2009,9 +2009,9 @@ class Program
 
         // Plage de lecture configurable via appsettings.json (clé "ProfileReadHours", défaut 6)
         var profileReadHours = int.TryParse(configuration["ProfileReadHours"], out var h) ? h : 6;
-        var dateEnd = DateTime.Now;
+        var dateEnd = DateTime.UtcNow;
         var dateStart = dateEnd.AddHours(-profileReadHours);
-        Console.WriteLine($"  Plage de lecture: {dateStart:yyyy-MM-dd HH:mm} -> {dateEnd:yyyy-MM-dd HH:mm}");
+        Console.WriteLine($"  Plage de lecture (UTC): {dateStart:yyyy-MM-dd HH:mm} -> {dateEnd:yyyy-MM-dd HH:mm}");
         Console.WriteLine($"  Logs dans: {outputDir}");
         Console.WriteLine();
 
@@ -2074,99 +2074,8 @@ class Program
                 report.ConnectionSuccess = true;
                 Console.WriteLine($"  HDLC OK ({hdlcSw.ElapsedMilliseconds}ms)");
 
-                // 2b. Lire scalers et unites
-                try
-                {
-                    session.Reader.GetScalersAndUnits();
-                    session.ScalersLoaded = true;
-
-                    var regObjects = session.Client!.Objects.GetObjects(
-                        new ObjectType[] { ObjectType.Register, ObjectType.ExtendedRegister, ObjectType.DemandRegister });
-
-                    foreach (GXDLMSObject obj in regObjects)
-                    {
-                        double scaler = 1;
-                        int unitCode = 0;
-                        if (obj is GXDLMSRegister reg)
-                        {
-                            scaler = reg.Scaler;
-                            unitCode = (int)reg.Unit;
-                        }
-                        else if (obj is GXDLMSExtendedRegister ereg)
-                        {
-                            scaler = ereg.Scaler;
-                            unitCode = (int)ereg.Unit;
-                        }
-                        else if (obj is GXDLMSDemandRegister dreg)
-                        {
-                            scaler = dreg.Scaler;
-                            unitCode = (int)dreg.Unit;
-                        }
-                        report.Scalers[obj.LogicalName] = new ScalerInfo
-                        {
-                            Scaler = scaler,
-                            Unit = ((Unit)unitCode).ToString(),
-                            UnitCode = unitCode
-                        };
-                    }
-
-                    // Log key scalers (energy, power, current, voltage, frequency)
-                    var keyScalers = report.Scalers
-                        .Where(s => s.Value.UnitCode > 0)
-                        .OrderBy(s => s.Key)
-                        .Take(8);
-                    Console.WriteLine($"  Scalers: {report.Scalers.Count} registres charges");
-                    foreach (var ks in keyScalers)
-                        Console.WriteLine($"    {ks.Key}: scaler={ks.Value.Scaler}, unit={ks.Value.Unit} ({ks.Value.UnitCode})");
-                }
-                catch (Exception scalerEx)
-                {
-                    Console.WriteLine($"  WARN: Scalers non lus: {scalerEx.Message}");
-                }
-
-                // 2c. Lire TC/TT
-                double tcVal = 1.0, ttVal = 1.0;
-                try
-                {
-                    foreach (var obisCode in TcTtObis)
-                    {
-                        try
-                        {
-                            var obj = session.Client!.Objects.FindByLN(ObjectType.None, obisCode);
-                            if (obj != null)
-                            {
-                                var val = session.Reader.Read(obj, 2);
-                                report.TcTtValues[obisCode] = val;
-                            }
-                            else
-                            {
-                                report.TcTtValues[obisCode] = null;
-                            }
-                        }
-                        catch (Exception tcEx)
-                        {
-                            report.TcTtValues[obisCode] = $"ERR:{tcEx.Message}";
-                        }
-                    }
-
-                    // Compute TC and TT values
-                    if (report.TcTtValues.TryGetValue("1.0.0.4.2.255", out var ctNum) && ctNum != null)
-                    {
-                        if (double.TryParse(ctNum.ToString(), out double v) && v > 0) tcVal = v;
-                    }
-                    if (report.TcTtValues.TryGetValue("1.0.0.4.5.255", out var vtNum) && vtNum != null)
-                    {
-                        if (double.TryParse(vtNum.ToString(), out double v) && v > 0) ttVal = v;
-                    }
-
-                    Console.WriteLine($"  TC={tcVal}, TT={ttVal}, TC*TT={tcVal * ttVal}");
-                }
-                catch (Exception tcttEx)
-                {
-                    Console.WriteLine($"  WARN: TC/TT non lus: {tcttEx.Message}");
-                }
-
                 // 3. Lire chaque profil (avec reconnexion HDLC après échec)
+                // NOTE: ReadRowsByRangeAsync charge l'association + scalers au premier appel
                 bool needsReconnect = false;
                 foreach (var (obis, name, timeout) in ProfileDefinitions)
                 {
@@ -2223,66 +2132,22 @@ class Program
                             profileResult.Success = true;
                             profileResult.RawData = result;
 
-                            // Deserialize entries: Key=rows, Value=columns (OBIS codes)
+                            // Deserialiser : extraire colonnes et rows bruts
+                            // Les conversions (scaled, TC*TT) seront appliquées après la boucle
                             var entries = Newtonsoft.Json.JsonConvert.DeserializeObject<
                                 List<KeyValuePair<Newtonsoft.Json.Linq.JArray, object[]>>>(result);
 
                             if (entries != null && entries.Count > 0)
                             {
                                 var entry = entries[0];
+                                profileResult.Columns = entry.Value.Select(c => c?.ToString() ?? "").ToArray();
 
-                                // Extract column names
-                                var columns = entry.Value.Select(c => c?.ToString() ?? "").ToArray();
-                                profileResult.Columns = columns;
-
-                                // Build per-column scaler and TC/TT factor arrays
-                                var colScalers = new double[columns.Length];
-                                var colTcTtFactors = new double[columns.Length];
-                                for (int ci = 0; ci < columns.Length; ci++)
-                                {
-                                    colScalers[ci] = report.Scalers.TryGetValue(columns[ci], out var si)
-                                        ? si.Scaler : 1.0;
-                                    var (factor, _) = GetTcTtFactor(columns[ci], tcVal, ttVal);
-                                    colTcTtFactors[ci] = factor;
-                                }
-
-                                // Process rows
                                 profileResult.RowsRaw = new List<object[]>();
-                                profileResult.RowsScaled = new List<object[]>();
-                                profileResult.RowsWithTcTt = new List<object[]>();
-
-                                var rowsArray = entry.Key;
-                                foreach (var rowToken in rowsArray)
+                                foreach (var rowToken in entry.Key)
                                 {
-                                    object[] rawRow;
                                     if (rowToken is Newtonsoft.Json.Linq.JArray rowArr)
-                                        rawRow = rowArr.Select(t => (object)t).ToArray();
-                                    else
-                                        rawRow = new object[] { rowToken };
-
-                                    profileResult.RowsRaw.Add(rawRow);
-
-                                    // Scaled values: raw * colScaler
-                                    var scaledRow = new object[rawRow.Length];
-                                    var tcttRow = new object[rawRow.Length];
-                                    for (int ci = 0; ci < rawRow.Length && ci < columns.Length; ci++)
-                                    {
-                                        if (double.TryParse(rawRow[ci]?.ToString(), out double numVal))
-                                        {
-                                            var scaled = numVal * colScalers[ci];
-                                            scaledRow[ci] = scaled;
-                                            tcttRow[ci] = scaled * colTcTtFactors[ci];
-                                        }
-                                        else
-                                        {
-                                            scaledRow[ci] = rawRow[ci];
-                                            tcttRow[ci] = rawRow[ci];
-                                        }
-                                    }
-                                    profileResult.RowsScaled.Add(scaledRow);
-                                    profileResult.RowsWithTcTt.Add(tcttRow);
+                                        profileResult.RowsRaw.Add(rowArr.Select(t => (object)t).ToArray());
                                 }
-
                                 profileResult.RowCount = profileResult.RowsRaw.Count;
                             }
                             else
@@ -2292,7 +2157,6 @@ class Program
 
                             Console.WriteLine($"OK — {profileResult.RowCount} lignes ({sw.ElapsedMilliseconds}ms)");
 
-                            // Sauvegarder le JSON brut dans un fichier
                             var fileName = $"{meter.Serial}_{obis.Replace(".", "_")}_{DateTime.Now:yyyyMMdd_HHmmss}.json";
                             var filePath = Path.Combine(outputDir, fileName);
                             await File.WriteAllTextAsync(filePath, result);
@@ -2318,7 +2182,131 @@ class Program
                     report.Profiles.Add(profileResult);
                 }
 
-                // 4. Sauvegarder JSON enrichi par compteur
+                // 4. Extraire scalers et TC/TT (après lecture profils, objets correctement chargés)
+                double tcVal = 1.0, ttVal = 1.0;
+                try
+                {
+                    var regObjects = session.Client!.Objects.GetObjects(
+                        new ObjectType[] { ObjectType.Register, ObjectType.ExtendedRegister, ObjectType.DemandRegister });
+
+                    foreach (GXDLMSObject obj in regObjects)
+                    {
+                        double scaler = 1;
+                        int unitCode = 0;
+                        if (obj is GXDLMSRegister reg)
+                        {
+                            scaler = reg.Scaler;
+                            unitCode = (int)reg.Unit;
+                        }
+                        else if (obj is GXDLMSExtendedRegister ereg)
+                        {
+                            scaler = ereg.Scaler;
+                            unitCode = (int)ereg.Unit;
+                        }
+                        else if (obj is GXDLMSDemandRegister dreg)
+                        {
+                            scaler = dreg.Scaler;
+                            unitCode = (int)dreg.Unit;
+                        }
+                        report.Scalers[obj.LogicalName] = new ScalerInfo
+                        {
+                            Scaler = scaler,
+                            Unit = ((Unit)unitCode).ToString(),
+                            UnitCode = unitCode
+                        };
+                    }
+                    Console.WriteLine($"  Scalers: {report.Scalers.Count} registres");
+                    // Afficher les scalers des registres énergie/puissance/courant/tension
+                    foreach (var ks in report.Scalers
+                        .Where(s => s.Key.StartsWith("1.0.") && (
+                            s.Key.Contains(".8.0.") || s.Key.Contains(".7.0.") ||
+                            s.Key.StartsWith("1.0.31.") || s.Key.StartsWith("1.0.32.") ||
+                            s.Key.StartsWith("1.0.51.") || s.Key.StartsWith("1.0.52.") ||
+                            s.Key.StartsWith("1.0.71.") || s.Key.StartsWith("1.0.72.") ||
+                            s.Key.StartsWith("1.0.14.")))
+                        .OrderBy(s => s.Key).Take(12))
+                        Console.WriteLine($"    {ks.Key}: scaler={ks.Value.Scaler}, unit={ks.Value.Unit}");
+
+                    // Lire TC/TT
+                    foreach (var obisCode in TcTtObis)
+                    {
+                        try
+                        {
+                            var obj = session.Client.Objects.FindByLN(ObjectType.None, obisCode);
+                            if (obj != null)
+                            {
+                                var val = session.Reader!.Read(obj, 2);
+                                report.TcTtValues[obisCode] = val;
+                            }
+                            else
+                            {
+                                report.TcTtValues[obisCode] = null;
+                            }
+                        }
+                        catch (Exception tcEx)
+                        {
+                            report.TcTtValues[obisCode] = $"ERR:{tcEx.Message}";
+                        }
+                    }
+
+                    // CT ratio = numerator(4.2) / denominator(4.5), VT ratio = numerator(4.3) / denominator(4.6)
+                    double ctNum = 1, ctDen = 1, vtNum = 1, vtDen = 1;
+                    if (report.TcTtValues.TryGetValue("1.0.0.4.2.255", out var v42) && v42 != null)
+                        double.TryParse(v42.ToString(), out ctNum);
+                    if (report.TcTtValues.TryGetValue("1.0.0.4.5.255", out var v45) && v45 != null)
+                        double.TryParse(v45.ToString(), out ctDen);
+                    if (report.TcTtValues.TryGetValue("1.0.0.4.3.255", out var v43) && v43 != null)
+                        double.TryParse(v43.ToString(), out vtNum);
+                    if (report.TcTtValues.TryGetValue("1.0.0.4.6.255", out var v46) && v46 != null)
+                        double.TryParse(v46.ToString(), out vtDen);
+
+                    tcVal = ctDen > 0 ? ctNum / ctDen : 1.0;  // CT = 150/5 = 30
+                    ttVal = vtDen > 0 ? vtNum / vtDen : 1.0;  // VT = 330/1 = 330
+                    Console.WriteLine($"  CT={ctNum}/{ctDen}={tcVal}, VT={vtNum}/{vtDen}={ttVal}, CT*VT={tcVal * ttVal}");
+
+                    // Appliquer conversions aux données déjà lues
+                    // NOTE: les valeurs "brut" sont déjà scalées par Gurux (GetScalersAndUnits appliqué)
+                    foreach (var p in report.Profiles.Where(p => p.Success && p.RowsRaw != null && p.Columns != null))
+                    {
+                        var colTcTtFactors = new double[p.Columns!.Length];
+                        var colConvFactors = new double[p.Columns.Length]; // ÷1000 pour énergie/puissance
+                        for (int ci = 0; ci < p.Columns.Length; ci++)
+                        {
+                            colTcTtFactors[ci] = GetTcTtFactor(p.Columns[ci], tcVal, ttVal).factor;
+                            colConvFactors[ci] = GetDisplayConversionFactor(p.Columns[ci]);
+                        }
+
+                        p.RowsConverted = new List<object[]>();
+                        p.RowsWithTcTt = new List<object[]>();
+                        foreach (var rawRow in p.RowsRaw!)
+                        {
+                            var convRow = new object[rawRow.Length];
+                            var tcttRow = new object[rawRow.Length];
+                            for (int ci = 0; ci < rawRow.Length; ci++)
+                            {
+                                if (ci < p.Columns.Length && rawRow[ci] is IConvertible conv)
+                                {
+                                    try
+                                    {
+                                        double val = conv.ToDouble(null);
+                                        convRow[ci] = Math.Round(val * colConvFactors[ci], 1);
+                                        tcttRow[ci] = val * colTcTtFactors[ci];
+                                    }
+                                    catch { convRow[ci] = rawRow[ci]; tcttRow[ci] = rawRow[ci]; }
+                                }
+                                else { convRow[ci] = rawRow[ci]; tcttRow[ci] = rawRow[ci]; }
+                            }
+                            p.RowsConverted.Add(convRow);
+                            p.RowsWithTcTt.Add(tcttRow);
+                        }
+                    }
+                }
+                catch (Exception metaEx)
+                {
+                    Console.WriteLine($"  WARN: Extraction scalers/TC_TT: {metaEx.Message}");
+                }
+
+                // 5. Sauvegarder JSON enrichi par compteur
                 try
                 {
                     var enrichedReport = new
@@ -2345,8 +2333,8 @@ class Program
                                 ? p.RowsRaw.Take(3).Select((row, ri) => new
                                 {
                                     brut = row,
-                                    scale = p.RowsScaled?.ElementAtOrDefault(ri),
-                                    avec_tc_tt = p.RowsWithTcTt?.ElementAtOrDefault(ri)
+                                    converti = p.RowsConverted?.ElementAtOrDefault(ri),
+                                    avec_ct_vt = p.RowsWithTcTt?.ElementAtOrDefault(ri)
                                 }).ToArray()
                                 : null
                         }).ToArray()
@@ -2427,9 +2415,14 @@ class Program
 
             // Key scalers (energy, power, current, voltage, frequency)
             var keyScalerObis = r.Scalers
-                .Where(s => s.Value.UnitCode > 0)
+                .Where(s => s.Key.StartsWith("1.0.") && (
+                    s.Key.Contains(".8.0.") || s.Key.Contains(".7.0.") ||
+                    s.Key.StartsWith("1.0.31.") || s.Key.StartsWith("1.0.32.") ||
+                    s.Key.StartsWith("1.0.51.") || s.Key.StartsWith("1.0.52.") ||
+                    s.Key.StartsWith("1.0.71.") || s.Key.StartsWith("1.0.72.") ||
+                    s.Key.StartsWith("1.0.14.")))
                 .OrderBy(s => s.Key)
-                .Take(8);
+                .Take(12);
             if (keyScalerObis.Any())
             {
                 Console.WriteLine($"    Scalers cles:");
@@ -2465,8 +2458,8 @@ class Program
                             }));
 
                         Console.WriteLine($"      Ligne {ri}: brut=[{FmtRow(p.RowsRaw[ri])}]");
-                        Console.WriteLine($"              scale=[{FmtRow(p.RowsScaled?.ElementAtOrDefault(ri))}]");
-                        Console.WriteLine($"              tc*tt=[{FmtRow(p.RowsWithTcTt?.ElementAtOrDefault(ri))}]");
+                        Console.WriteLine($"              conv=[{FmtRow(p.RowsConverted?.ElementAtOrDefault(ri))}]");
+                        Console.WriteLine($"              ct*vt=[{FmtRow(p.RowsWithTcTt?.ElementAtOrDefault(ri))}]");
                     }
                 }
             }
@@ -2494,6 +2487,31 @@ class Program
         }
 
         return (1.0, "x1");
+    }
+
+    /// <summary>
+    /// Facteur de conversion d'affichage : ÷1000 pour énergie (Wh→kWh) et puissance (W→kW),
+    /// ×1 pour tension, courant, fréquence, angle.
+    /// </summary>
+    private static double GetDisplayConversionFactor(string obisCode)
+    {
+        var parts = obisCode.Split('.');
+        if (parts.Length < 6) return 1.0;
+        if (!int.TryParse(parts[3], out int d)) return 1.0;
+
+        // D=8 (énergie) ou D=7 (puissance) : ÷1000 sauf courant/tension/fréquence/angle
+        if (d == 8) return 0.001; // Wh → kWh, varh → kvarh
+
+        if (d == 7 && int.TryParse(parts[2], out int c))
+        {
+            if (c == 31 || c == 51 || c == 71) return 1.0; // Courant (A)
+            if (c == 32 || c == 52 || c == 72) return 1.0; // Tension (V)
+            if (c == 14) return 1.0; // Fréquence (Hz)
+            if (c == 81) return 1.0; // Angle (°)
+            return 0.001; // Autres puissances W → kW, var → kvar
+        }
+
+        return 1.0;
     }
 
     // ===== Multi-pass helpers =====

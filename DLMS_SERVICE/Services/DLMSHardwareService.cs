@@ -468,16 +468,7 @@ namespace DLMS_SERVICE.Services
 
                                             var rawStr = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
                                             detailprofil.RawValue = rawStr;
-                                            if (isRegisterValue)
-                                            {
-                                                var factor = GetDisplayConversionFactor(objStr);
-                                                var converted = Convert.ToDecimal(realValue) * (decimal)factor;
-                                                detailprofil.Value = Math.Round(converted, 1).ToString();
-                                            }
-                                            else
-                                            {
-                                                detailprofil.Value = rawStr;
-                                            }
+                                            detailprofil.Value = rawStr;
                                             var resolvedCodeObisId = codeObisDict.TryGetValue(objStr, out var codeObis) ? codeObis.Id : 0;
                                             if (resolvedCodeObisId == 0)
                                             {
@@ -757,16 +748,7 @@ namespace DLMS_SERVICE.Services
 
                                     var rawStr = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
                                     detailprofil.RawValue = rawStr;
-                                    if (isRegisterValue)
-                                    {
-                                        var factor = GetDisplayConversionFactor(objStr);
-                                        var converted = Convert.ToDecimal(realValue) * (decimal)factor;
-                                        detailprofil.Value = Math.Round(converted, 1).ToString();
-                                    }
-                                    else
-                                    {
-                                        detailprofil.Value = rawStr;
-                                    }
+                                    detailprofil.Value = rawStr;
                                     detailprofil.CodeObisId = codeObisDict.TryGetValue(objStr, out var codeObis) ? codeObis.Id : 0;
                                     detailprofil.DateEnr = dateUtc;
                                     detailprofil.GxdlmsprofilgenericId = profilGeneric.Id;
@@ -1240,33 +1222,6 @@ namespace DLMS_SERVICE.Services
                 _logger.LogError(ex, "Erreur lors de l'archivage du CommandeCompteur {CommandeCompteurId}", commandeCompteurId);
                 throw;
             }
-        }
-
-
-        /// <summary>
-        /// Facteur de conversion d'affichage : ÷1000 pour énergie (Wh→kWh) et puissance (W→kW),
-        /// ×1 pour tension, courant, fréquence, angle.
-        /// </summary>
-        private static double GetDisplayConversionFactor(string obisCode)
-        {
-            var parts = obisCode.Split('.');
-            if (parts.Length < 6) return 1.0;
-            if (!int.TryParse(parts[3], out int d)) return 1.0;
-
-            // D=8 (énergie) : Wh→kWh, varh→kvarh
-            if (d == 8) return 0.001;
-
-            // D=7 (puissance) : selon le type de mesure
-            if (d == 7 && int.TryParse(parts[2], out int c))
-            {
-                if (c == 31 || c == 51 || c == 71) return 1.0; // Courant (A)
-                if (c == 32 || c == 52 || c == 72) return 1.0; // Tension (V)
-                if (c == 14) return 1.0; // Fréquence (Hz)
-                if (c == 81) return 1.0; // Angle (°)
-                return 0.001; // Puissance active/réactive W→kW, var→kvar
-            }
-
-            return 1.0;
         }
      }
 }

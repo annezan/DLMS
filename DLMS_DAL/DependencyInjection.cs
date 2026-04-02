@@ -114,6 +114,7 @@ namespace DLMS.Infrastructure
 
             services.AddTransient<IReadQueryRepository, ReadQueryRepository>();
             services.AddTransient<IReadObjectProfileQueryRepository, ReadObjectProfileQueryRepository>();
+            // ICommandExecutor sera résolu depuis le conteneur DI parent (enregistré par DLMS_SERVICE ou DLMS.API)
             services.AddTransient<IReadObjectCommandeQueryRepository, ReadObjectCommandeQueryRepository>();
             services.AddTransient<ITestConnexionQueryRepository, TestConnexionQueryRepository>();
             services.AddTransient<IReadRowsByRangeQueryRepository, ReadRowsByRangeQueryRepository>();

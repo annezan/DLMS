@@ -14,6 +14,10 @@ public partial class Gxdlmsprofilgenericdetail
     public int GxdlmsprofilgenericId { get; set; }
     public string Value { get; set; } = null!;
     public string? RawValue { get; set; }
+    public string? Unite { get; set; }
+    public int? Exposant { get; set; }
+    public double? ScalerGurux { get; set; }
+    public DateTime? DateCreation { get; set; }
 
     public string NumeroCompteur { get; set; }
     public DateTime? DateEnr { get; set; }

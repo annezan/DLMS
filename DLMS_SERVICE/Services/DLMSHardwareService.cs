@@ -17,13 +17,15 @@ using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using DLMS_COMMUNICATION.Reader;
+using DLMS_MODELS.ServiceContracts;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System.Data;
 
 namespace DLMS_SERVICE.Services
 {
-    public interface IDLMSHardwareService
+    public interface IDLMSHardwareService : DLMS_MODELS.ServiceContracts.ICommandExecutor
     {
         Task<DLMSReadResult> ReadInstantAsync(DLMSReadRequest request);
         Task<DLMSReadResult> ReadProfileAsync(DLMSReadRequest request);
@@ -33,6 +35,7 @@ namespace DLMS_SERVICE.Services
         Task<int> GetNextTentativeNumberAsync(int commandeCompteurId);
         Task<bool> CheckAndArchiveCommandIfAllCompteursArchivedAsync(int commandeId);
         Task ArchiveCommandeCompteurAsync(int commandeCompteurId);
+        Task<CommandResult> ExecuteCommandAsync(CommandRequest request);
     }
 
     public class DLMSReadRequest
@@ -60,11 +63,20 @@ namespace DLMS_SERVICE.Services
     {
         private readonly ILogger<DLMSHardwareService> _logger;
         private readonly IServiceScopeFactory _serviceScopeFactory;
+        private readonly IDLMSGuruxSessionFactory _sessionFactory;
+        private readonly IMeterLockService _meterLock;
         private const int BatchSize = 500;
-        public DLMSHardwareService(ILogger<DLMSHardwareService> logger, IServiceScopeFactory serviceScopeFactory)
+
+        public DLMSHardwareService(
+            ILogger<DLMSHardwareService> logger,
+            IServiceScopeFactory serviceScopeFactory,
+            IDLMSGuruxSessionFactory sessionFactory = null,
+            IMeterLockService meterLock = null)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _serviceScopeFactory = serviceScopeFactory ?? throw new ArgumentNullException(nameof(serviceScopeFactory));
+            _sessionFactory = sessionFactory;
+            _meterLock = meterLock;
         }
 
         public async Task<DLMSReadResult> ReadInstantAsync(DLMSReadRequest request)
@@ -321,7 +333,7 @@ namespace DLMS_SERVICE.Services
             {
                 _logger.LogDebug("Traitement et enregistrement des données de profil pour {SerialNumber}", serialNumber);
 
-                var entries = JsonConvert.DeserializeObject<List<KeyValuePair<object[], object[]>>>(data);
+                var (entries, scalers, tctt) = DeserializeProfileData(data);
 
                 if (entries == null || entries.Count == 0)
                 {
@@ -389,6 +401,22 @@ namespace DLMS_SERVICE.Services
                 //_logger.LogInformation("eventValues trouvés: {EventValues}", string.Join(", ", eventValues));
                 //_logger.LogInformation("eventsDict construit avec {Count} éléments: {DictKeys}", 
                 //    eventsDict.Count, string.Join(", ", eventsDict.Keys));
+
+                // Mettre à jour TC/TT sur le compteur si disponible
+                if (tctt.Count > 0)
+                {
+                    try { await UpdateCompteurTcTtAsync(serialNumber, tctt, context); }
+                    catch (Exception tcttEx) { _logger.LogWarning(tcttEx, "Erreur MAJ TC/TT pour {Serial}", serialNumber); }
+                }
+
+                // Calculer TC/TT pour application aux valeurs
+                double tcRatio = 1.0, ttRatio = 1.0;
+                if (tctt.TryGetValue("1.0.0.4.2.255", out var ctNum1) && ctNum1.HasValue &&
+                    tctt.TryGetValue("1.0.0.4.3.255", out var ctDen1) && ctDen1.HasValue && ctDen1 > 0)
+                    tcRatio = ctNum1.Value / ctDen1.Value;
+                if (tctt.TryGetValue("1.0.0.4.5.255", out var vtNum1) && vtNum1.HasValue &&
+                    tctt.TryGetValue("1.0.0.4.6.255", out var vtDen1) && vtDen1.HasValue && vtDen1 > 0)
+                    ttRatio = vtNum1.Value / vtDen1.Value;
 
                 // 🔥 OPTIMISATION 4: Désactiver le tracking EF
                 context.ChangeTracker.AutoDetectChangesEnabled = false;
@@ -468,7 +496,32 @@ namespace DLMS_SERVICE.Services
 
                                             var rawStr = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
                                             detailprofil.RawValue = rawStr;
-                                            detailprofil.Value = rawStr;
+                                            detailprofil.DateCreation = DateTime.UtcNow;
+
+                                            // Métadonnées scaler + conversion
+                                            // Les valeurs sont GARANTIES brutes (Gurux reset Scaler=1)
+                                            // Value = RawValue × Scaler (le scaler incorpore déjà le TC/TT)
+                                            if (isRegisterValue && scalers.TryGetValue(objStr, out var meta))
+                                            {
+                                                detailprofil.Unite = meta.Unit;
+                                                detailprofil.Exposant = meta.Exponent;
+                                                detailprofil.ScalerGurux = meta.Scaler;
+
+                                                if (meta.Scaler != 1.0 && meta.Scaler != 0)
+                                                {
+                                                    var convertedValue = Convert.ToDecimal(realValue) * (decimal)meta.Scaler;
+                                                    detailprofil.Value = convertedValue.ToString();
+                                                }
+                                                else
+                                                {
+                                                    detailprofil.Value = rawStr;
+                                                }
+                                            }
+                                            else
+                                            {
+                                                detailprofil.Value = rawStr;
+                                            }
+
                                             var resolvedCodeObisId = codeObisDict.TryGetValue(objStr, out var codeObis) ? codeObis.Id : 0;
                                             if (resolvedCodeObisId == 0)
                                             {
@@ -569,7 +622,11 @@ namespace DLMS_SERVICE.Services
                                 {
                                     nameof(Gxdlmsprofilgenericdetail.Value),
                                     nameof(Gxdlmsprofilgenericdetail.RawValue),
-                                    nameof(Gxdlmsprofilgenericdetail.IsArchive)
+                                    nameof(Gxdlmsprofilgenericdetail.IsArchive),
+                                    nameof(Gxdlmsprofilgenericdetail.Unite),
+                                    nameof(Gxdlmsprofilgenericdetail.Exposant),
+                                    nameof(Gxdlmsprofilgenericdetail.ScalerGurux),
+                                    nameof(Gxdlmsprofilgenericdetail.DateCreation)
                                 }
                             });
                             detailsToAdd.Clear();
@@ -626,7 +683,7 @@ namespace DLMS_SERVICE.Services
             {
                 _logger.LogDebug("Traitement profil unique {ProfileObis} pour {SerialNumber}", profileObis, serialNumber);
 
-                var entries = JsonConvert.DeserializeObject<List<KeyValuePair<object[], object[]>>>(data);
+                var (entries, scalers, tctt) = DeserializeProfileData(data);
 
                 if (entries == null || entries.Count == 0)
                 {
@@ -636,6 +693,13 @@ namespace DLMS_SERVICE.Services
 
                 using var scope = _serviceScopeFactory.CreateScope();
                 var context = scope.ServiceProvider.GetRequiredService<DLMSDBContext>();
+
+                // Mettre à jour TC/TT sur le compteur si disponible
+                if (tctt.Count > 0)
+                {
+                    try { await UpdateCompteurTcTtAsync(serialNumber, tctt, context); }
+                    catch (Exception tcttEx) { _logger.LogWarning(tcttEx, "Erreur MAJ TC/TT pour {Serial}", serialNumber); }
+                }
 
                 // Lookup profile generic via Join on CodeObis
                 var profilGenericResult = await context.Gxdlmsprofilgenerics
@@ -672,6 +736,15 @@ namespace DLMS_SERVICE.Services
                     .ToListAsync())
                     .GroupBy(e => e.Value)
                     .ToDictionary(g => g.Key, g => g.First());
+
+                // Calculer TC/TT pour application aux valeurs
+                double tcRatio2 = 1.0, ttRatio2 = 1.0;
+                if (tctt.TryGetValue("1.0.0.4.2.255", out var ctNum2) && ctNum2.HasValue &&
+                    tctt.TryGetValue("1.0.0.4.3.255", out var ctDen2) && ctDen2.HasValue && ctDen2 > 0)
+                    tcRatio2 = ctNum2.Value / ctDen2.Value;
+                if (tctt.TryGetValue("1.0.0.4.5.255", out var vtNum2) && vtNum2.HasValue &&
+                    tctt.TryGetValue("1.0.0.4.6.255", out var vtDen2) && vtDen2.HasValue && vtDen2 > 0)
+                    ttRatio2 = vtNum2.Value / vtDen2.Value;
 
                 // Disable EF tracking
                 context.ChangeTracker.AutoDetectChangesEnabled = false;
@@ -748,7 +821,32 @@ namespace DLMS_SERVICE.Services
 
                                     var rawStr = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
                                     detailprofil.RawValue = rawStr;
-                                    detailprofil.Value = rawStr;
+                                    detailprofil.DateCreation = DateTime.UtcNow;
+
+                                    // Métadonnées scaler + conversion
+                                    // Les valeurs sont GARANTIES brutes (Gurux reset Scaler=1)
+                                    // Value = RawValue × Scaler (le scaler incorpore déjà le TC/TT)
+                                    if (isRegisterValue && scalers.TryGetValue(objStr, out var meta))
+                                    {
+                                        detailprofil.Unite = meta.Unit;
+                                        detailprofil.Exposant = meta.Exponent;
+                                        detailprofil.ScalerGurux = meta.Scaler;
+
+                                        if (meta.Scaler != 1.0 && meta.Scaler != 0)
+                                        {
+                                            var convertedValue = Convert.ToDecimal(realValue) * (decimal)meta.Scaler;
+                                            detailprofil.Value = convertedValue.ToString();
+                                        }
+                                        else
+                                        {
+                                            detailprofil.Value = rawStr;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        detailprofil.Value = rawStr;
+                                    }
+
                                     detailprofil.CodeObisId = codeObisDict.TryGetValue(objStr, out var codeObis) ? codeObis.Id : 0;
                                     detailprofil.DateEnr = dateUtc;
                                     detailprofil.GxdlmsprofilgenericId = profilGeneric.Id;
@@ -822,7 +920,10 @@ namespace DLMS_SERVICE.Services
                         {
                             nameof(Gxdlmsprofilgenericdetail.Value),
                             nameof(Gxdlmsprofilgenericdetail.RawValue),
-                            nameof(Gxdlmsprofilgenericdetail.IsArchive)
+                            nameof(Gxdlmsprofilgenericdetail.IsArchive),
+                            nameof(Gxdlmsprofilgenericdetail.Unite),
+                            nameof(Gxdlmsprofilgenericdetail.Exposant),
+                            nameof(Gxdlmsprofilgenericdetail.ScalerGurux)
                         }
                     });
                 }
@@ -859,6 +960,308 @@ namespace DLMS_SERVICE.Services
             {
                 _logger.LogError(ex, "Erreur lors du traitement profil unique {ProfileObis} pour {SerialNumber}", profileObis, serialNumber);
                 return 0;
+            }
+        }
+
+        /// <summary>
+        /// Exécute une commande DLMS à la demande (depuis le front-end).
+        /// Gère ReadByRange, ReadByEntry et GetClock avec verrou par IP.
+        /// </summary>
+        public async Task<CommandResult> ExecuteCommandAsync(CommandRequest request)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                _logger.LogInformation("ExecuteCommand {Type} pour {Serial} sur {IP}",
+                    request.Type, request.SerialNumber, request.AddressIp);
+
+                // Verrou par IP pour éviter les conflits avec les lectures horaires
+                IDisposable lockHandle = null;
+                if (_meterLock != null)
+                {
+                    lockHandle = await _meterLock.AcquireAsync(request.AddressIp);
+                }
+
+                try
+                {
+                    var connParams = new DLMS_MODELS.DLMSConnectionParameters
+                    {
+                        AddressIp = request.AddressIp,
+                        Port = request.Port ?? "4059",
+                        ClientAddress = "read",
+                        SerialNumber = request.SerialNumber,
+                        InterfaceType = "HDLC",
+                        Password = request.Password,
+                        AuthenticationKey = request.AuthenticationKey,
+                        UnicastKey = request.UnicastKey
+                    };
+
+                    using var session = _sessionFactory.CreateSession(connParams);
+                    session.InitializeMeterClient(connParams);
+
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+                    if (!await session.OpenTransportAsync(cts.Token))
+                    {
+                        return new CommandResult { Success = false, ErrorMessage = "Connexion TCP échouée", Duration = sw.Elapsed };
+                    }
+
+                    session.Reader.InitializeConnection();
+
+                    var reader = new DLMS_COMMUNICATION.Reader.NonStaticReaderCommunication(_logger as ILogger<DLMS_COMMUNICATION.Reader.NonStaticReaderCommunication>);
+                    string resultJson;
+
+                    switch (request.Type)
+                    {
+                        case DlmsCommandType.GetClock:
+                            resultJson = await reader.ReadClockAsync(session);
+                            sw.Stop();
+                            return new CommandResult { Success = true, Data = resultJson, RowCount = 1, Duration = sw.Elapsed };
+
+                        case DlmsCommandType.ReadByEntry:
+                            session.ReadObjects.Clear();
+                            session.ReadObjects.AddRange(ParseObjects($"{request.ProfileObis}:2"));
+                            resultJson = await reader.ReadRowsByEntryAsync(session, request.NombreEntree);
+                            break;
+
+                        case DlmsCommandType.ReadByRange:
+                        default:
+                            session.ReadObjects.Clear();
+                            session.ReadObjects.AddRange(ParseObjects($"{request.ProfileObis}:2"));
+                            var dateStart = request.DateStart?.ToString("yyyy-MM-dd HH:mm:ss") ?? DateTime.Now.AddHours(-24).ToString("yyyy-MM-dd HH:mm:ss");
+                            var dateEnd = request.DateEnd?.ToString("yyyy-MM-dd HH:mm:ss") ?? DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                            resultJson = await reader.ReadRowsByRangeAsync(session, dateStart, dateEnd);
+                            break;
+                    }
+
+                    if (string.IsNullOrEmpty(resultJson) || resultJson == "Lecture impossible")
+                    {
+                        sw.Stop();
+                        return new CommandResult { Success = false, ErrorMessage = "Lecture impossible", Duration = sw.Elapsed };
+                    }
+
+                    // Persister les résultats avec conversion scaler si commandeCompteurId fourni
+                    int rowCount = 0;
+                    if (request.CommandeCompteurId.HasValue)
+                    {
+                        var (entries, scalers, tctt) = DeserializeProfileData(resultJson);
+                        rowCount = await PersistCommandResultsAsync(entries, scalers, request.SerialNumber,
+                            request.CommandeCompteurId.Value, request.ProfileObis);
+                    }
+
+                    sw.Stop();
+                    return new CommandResult { Success = true, Data = resultJson, RowCount = rowCount, Duration = sw.Elapsed };
+                }
+                finally
+                {
+                    lockHandle?.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                _logger.LogError(ex, "ExecuteCommand echec pour {Serial}: {Error}", request.SerialNumber, ex.Message);
+                return new CommandResult { Success = false, ErrorMessage = ex.Message, Duration = sw.Elapsed };
+            }
+        }
+
+        /// <summary>
+        /// Persiste les résultats d'une commande on-demand dans ResultatCommandeCompteur avec conversion scaler.
+        /// </summary>
+        private async Task<int> PersistCommandResultsAsync(
+            List<KeyValuePair<object[], object[]>> entries,
+            Dictionary<string, ScalerMetadata> scalers,
+            string serialNumber,
+            int commandeCompteurId,
+            string profileObis)
+        {
+            using var scope = _serviceScopeFactory.CreateScope();
+            var context = scope.ServiceProvider.GetRequiredService<DLMSDBContext>();
+
+            var profilGenericResult = await context.Gxdlmsprofilgenerics
+                .Join(context.CodeObis, pg => pg.CodeObisId, co => co.Id,
+                    (pg, co) => new { pg, co.Value })
+                .FirstOrDefaultAsync(x => x.Value == profileObis);
+
+            if (profilGenericResult == null) return 0;
+
+            var allObisValues = entries.SelectMany(e => e.Value.Select(v => v?.ToString())).Where(s => !string.IsNullOrEmpty(s)).Distinct().ToList();
+            var codeObisDict = (await context.CodeObis.Where(c => allObisValues.Contains(c.Value)).ToListAsync())
+                .GroupBy(c => c.Value).ToDictionary(g => g.Key, g => g.First());
+
+            int count = 0;
+            foreach (var entry in entries)
+            {
+                foreach (var row in entry.Key)
+                {
+                    if (row is not IEnumerable<object> values) continue;
+                    var array = values.ToArray();
+
+                    DateTime dateUtc = DateTime.MinValue;
+                    if (array.Length > 0)
+                    {
+                        var dateStr = array[0]?.ToString() ?? "";
+                        if (DateTime.TryParse(dateStr, out DateTime dv))
+                            dateUtc = DateTimeOffset.FromUnixTimeSeconds(((DateTimeOffset)dv).ToUnixTimeSeconds()).UtcDateTime;
+                        else if (long.TryParse(dateStr, out long ts) && ts > 946684800)
+                            dateUtc = DateTimeOffset.FromUnixTimeSeconds(ts).UtcDateTime;
+                        else continue;
+                    }
+
+                    for (int i = 0; i < entry.Value.Length; i++)
+                    {
+                        var objStr = entry.Value[i]?.ToString() ?? "";
+                        if (!codeObisDict.TryGetValue(objStr, out var codeObis)) continue;
+
+                        object realValue;
+                        try { realValue = ((Newtonsoft.Json.Linq.JValue)array[i]).Value; }
+                        catch { realValue = array[i]; }
+
+                        bool isRegisterValue = realValue is decimal || realValue is double || realValue is float
+                            || realValue is int || realValue is long;
+
+                        var rawStr = isRegisterValue ? Convert.ToDecimal(realValue).ToString() : realValue?.ToString();
+
+                        var resultat = new DLMS_MODELS.CommandeCompteurDomain.Entities.ResultatCommandeCompteur
+                        {
+                            CommandeCompteurId = commandeCompteurId,
+                            CodeObisId = codeObis.Id,
+                            GxdlmsprofilgenericId = profilGenericResult.pg.Id,
+                            NumeroCompteur = serialNumber,
+                            DateEnr = dateUtc,
+                            IsArchive = false,
+                            RawValue = rawStr,
+                            DateCreation = DateTime.UtcNow
+                        };
+
+                        // Value = RawValue (la conversion sera faite par le front)
+                        // Les métadonnées scaler sont stockées pour que le front puisse convertir
+                        resultat.Value = rawStr;
+                        if (scalers.TryGetValue(objStr, out var meta))
+                        {
+                            resultat.Unite = meta.Unit;
+                            resultat.Exposant = meta.Exponent;
+                            resultat.ScalerGurux = meta.Scaler;
+                        }
+
+                        context.Add(resultat);
+                        count++;
+                    }
+                }
+            }
+
+            if (count > 0) await context.SaveChangesAsync();
+            return count;
+        }
+
+        private static List<KeyValuePair<string, int>> ParseObjects(string objects)
+        {
+            var result = new List<KeyValuePair<string, int>>();
+            foreach (var obj in objects.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var parts = obj.Split(':');
+                if (parts.Length == 2 && int.TryParse(parts[1], out int attr))
+                    result.Add(new KeyValuePair<string, int>(parts[0], attr));
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Détermine le facteur TC/TT à appliquer selon le code OBIS du registre.
+        /// Energy (D=8) → TC×TT, Courant (C=31/51/71) → TC, Tension (C=32/52/72) → TT
+        /// </summary>
+        private static double GetTcTtFactor(string obisCode, double tc, double tt)
+        {
+            var parts = obisCode.Split('.');
+            if (parts.Length < 6) return 1.0;
+            if (!int.TryParse(parts[2], out int c) || !int.TryParse(parts[3], out int d))
+                return 1.0;
+
+            if (d == 8) return tc * tt; // Energy → ×TC×TT
+
+            if (d == 7)
+            {
+                if (c == 31 || c == 51 || c == 71) return tc;   // Courant → ×TC
+                if (c == 32 || c == 52 || c == 72) return tt;   // Tension → ×TT
+                if (c == 14 || c == 81) return 1.0;             // Fréquence, angle → ×1
+                return tc * tt;                                  // Autres puissances → ×TC×TT
+            }
+            return 1.0;
+        }
+
+        /// <summary>
+        /// Désérialise le JSON de profil en supportant l'ancien format (tableau direct)
+        /// et le nouveau format (enveloppe avec scalers + TC/TT).
+        /// </summary>
+        private (List<KeyValuePair<object[], object[]>> entries, Dictionary<string, ScalerMetadata> scalers, Dictionary<string, double?> tctt)
+            DeserializeProfileData(string data)
+        {
+            var trimmed = data.TrimStart();
+            if (trimmed.StartsWith("{"))
+            {
+                var envelope = JsonConvert.DeserializeObject<ProfileDataEnvelope>(data);
+                return (
+                    envelope?.Entries ?? new(),
+                    envelope?.Scalers ?? new(),
+                    envelope?.TcTtValues ?? new()
+                );
+            }
+            // Ancien format direct (rétrocompatibilité)
+            var entries = JsonConvert.DeserializeObject<List<KeyValuePair<object[], object[]>>>(data);
+            return (entries ?? new(), new Dictionary<string, ScalerMetadata>(), new Dictionary<string, double?>());
+        }
+
+        /// <summary>
+        /// Met à jour les rapports TC/TT sur le compteur si des valeurs sont disponibles.
+        /// </summary>
+        private async Task UpdateCompteurTcTtAsync(
+            string serialNumber,
+            Dictionary<string, double?> tctt,
+            DLMSDBContext context)
+        {
+            tctt.TryGetValue("1.0.0.4.2.255", out var ctNum);
+            tctt.TryGetValue("1.0.0.4.3.255", out var ctDen);
+            tctt.TryGetValue("1.0.0.4.5.255", out var vtNum);
+            tctt.TryGetValue("1.0.0.4.6.255", out var vtDen);
+
+            double? rapportTC = (ctNum.HasValue && ctDen.HasValue && ctDen > 0)
+                ? ctNum.Value / ctDen.Value : null;
+            double? rapportTT = (vtNum.HasValue && vtDen.HasValue && vtDen > 0)
+                ? vtNum.Value / vtDen.Value : null;
+
+            if (rapportTC == null && rapportTT == null) return;
+
+            var compteur = await context.Compteur
+                .FirstOrDefaultAsync(c => c.NumeroCompteur == serialNumber && c.IsArchive == false);
+
+            if (compteur == null)
+            {
+                _logger.LogWarning("Compteur {Serial} introuvable pour MAJ TC/TT", serialNumber);
+                return;
+            }
+
+            bool updated = false;
+            if (rapportTC.HasValue && compteur.RapportTC != rapportTC)
+            {
+                compteur.RapportTC = rapportTC;
+                compteur.TCNumerateur = ctNum;
+                compteur.TCDenominateur = ctDen;
+                updated = true;
+            }
+            if (rapportTT.HasValue && compteur.RapportTT != rapportTT)
+            {
+                compteur.RapportTT = rapportTT;
+                compteur.TTNumerateur = vtNum;
+                compteur.TTDenominateur = vtDen;
+                updated = true;
+            }
+
+            if (updated)
+            {
+                compteur.UpdatedAt = DateTime.Now;
+                context.Compteur.Update(compteur);
+                await context.SaveChangesAsync();
+                _logger.LogInformation("TC/TT mis à jour pour {Serial}: TC={TC}, TT={TT}",
+                    serialNumber, rapportTC, rapportTT);
             }
         }
 

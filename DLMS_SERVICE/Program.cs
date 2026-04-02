@@ -135,7 +135,10 @@ namespace DLMS_SERVICE
                 services.AddSingleton<IDLMSGuruxSessionFactory, DLMSGuruxSessionFactory>();
                 
                 // Services métier spécialisés (architecture propre)
+                services.AddSingleton<IMeterLockService, MeterLockService>();
                 services.AddTransient<IDLMSHardwareService, DLMSHardwareService>();
+                services.AddTransient<DLMS_MODELS.ServiceContracts.ICommandExecutor>(sp =>
+                    sp.GetRequiredService<IDLMSHardwareService>());
                 services.AddTransient<IDLMSParallelReadService, DLMSParallelReadService>();
                 services.AddTransient<IDLMSMissingReadService, DLMSMissingReadService>();
                 services.AddTransient<IDLMSCommandProcessorService, DLMSCommandProcessorService>();

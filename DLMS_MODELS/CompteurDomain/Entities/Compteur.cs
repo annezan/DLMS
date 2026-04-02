@@ -44,6 +44,13 @@ public partial class Compteur : AuditableEntity
 
     public string? Etatcontacteur { get; set; }
 
+    public double? RapportTC { get; set; }
+    public double? RapportTT { get; set; }
+    public double? TCNumerateur { get; set; }
+    public double? TCDenominateur { get; set; }
+    public double? TTNumerateur { get; set; }
+    public double? TTDenominateur { get; set; }
+
     //public virtual ICollection<AssociationKey> AssociationKeys { get; set; } = new List<AssociationKey>();
 
     public Fabricant Fabriquant { get; set; }

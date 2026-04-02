@@ -30,38 +30,11 @@ namespace DLMS_DAL.GxdlmsprofilgenericDomainDal.Repositories.Queries
                     .OrderBy(x => x.Id)
                     .ToListAsync();
 
-                // Divide values by 1000 for specific OBIS units
-                var unitsToDivide = new[] { "Kvarh", "Kvar", "Kwh", "KVA", "KW", "KVAh" };
-                
-                var result = new List<Gxdlmsprofilgenericdetail>();
-                
-                foreach (var detail in Gxdlmsprofilgenericdetails)
-                {
-                    var newDetail = new Gxdlmsprofilgenericdetail
-                    {
-                        Id = detail.Id,
-                        CodeObisId = detail.CodeObisId,
-                        GxdlmsprofilgenericId = detail.GxdlmsprofilgenericId,
-                        NumeroCompteur = detail.NumeroCompteur,
-                        DateEnr = detail.DateEnr,
-                        IsArchive = detail.IsArchive,
-                        Codeobis = detail.Codeobis,
-                        Gxdlmsprofilgeneric = detail.Gxdlmsprofilgeneric,
-                        Value = detail.Value
-                    };
-                    
-                    if (detail.Codeobis?.Unit != null && unitsToDivide.Contains(detail.Codeobis.Unit))
-                    {
-                        if (decimal.TryParse(detail.Value, out decimal value))
-                        {
-                            newDetail.Value = (value / 1000).ToString();
-                        }
-                    }
-                    
-                    result.Add(newDetail);
-                }
+                // La conversion ÷1000 a été supprimée : Value contient désormais
+                // la valeur correctement scalée (raw × scaler Gurux) depuis le service.
+                // L'ancienne division créait une double conversion.
 
-                return result;
+                return Gxdlmsprofilgenericdetails;
             }
             catch (Exception ex)
             {
@@ -99,38 +72,10 @@ namespace DLMS_DAL.GxdlmsprofilgenericDomainDal.Repositories.Queries
                     .OrderBy(x => x.Id)
                     .ToListAsync();
 
-                // Divide values by 1000 for specific OBIS units
-                var unitsToDivide = new[] { "Kvarh", "Kvar", "Kwh", "KVA", "KW", "KVAh" };
-                
-                var result = new List<Gxdlmsprofilgenericdetail>();
-                
-                foreach (var detail in Gxdlmsprofilgenericdetails)
-                {
-                    var newDetail = new Gxdlmsprofilgenericdetail
-                    {
-                        Id = detail.Id,
-                        CodeObisId = detail.CodeObisId,
-                        GxdlmsprofilgenericId = detail.GxdlmsprofilgenericId,
-                        NumeroCompteur = detail.NumeroCompteur,
-                        DateEnr = detail.DateEnr,
-                        IsArchive = detail.IsArchive,
-                        Codeobis = detail.Codeobis,
-                        Gxdlmsprofilgeneric = detail.Gxdlmsprofilgeneric,
-                        Value = detail.Value
-                    };
-                    
-                    if (detail.Codeobis?.Unit != null && unitsToDivide.Contains(detail.Codeobis.Unit))
-                    {
-                        if (decimal.TryParse(detail.Value, out decimal value))
-                        {
-                            newDetail.Value = (value / 1000).ToString();
-                        }
-                    }
-                    
-                    result.Add(newDetail);
-                }
+                // La conversion ÷1000 a été supprimée : Value contient désormais
+                // la valeur correctement scalée (raw × scaler Gurux) depuis le service.
 
-                return result;
+                return Gxdlmsprofilgenericdetails;
             }
             catch (Exception ex)
             {

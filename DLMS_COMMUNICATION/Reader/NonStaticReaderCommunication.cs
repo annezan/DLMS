@@ -14,6 +14,7 @@ using System.Text;
 using System.Xml;
 using Microsoft.Extensions.Logging;
 using DLMS_COMMUNICATION.Reader;
+using GuruxUnit = Gurux.DLMS.Enums.Unit;
 
 namespace DLMS_COMMUNICATION.Reader
 {
@@ -182,14 +183,8 @@ namespace DLMS_COMMUNICATION.Reader
                     session.AssociationLoaded = true;
                 }
 
-                // Scalers : une seule fois par session (évite les round-trips réseau redondants)
-                if (!session.ScalersLoaded)
-                {
-                    session.Reader.GetScalersAndUnits();
-                    session.ScalersLoaded = true;
-                }
-
                 var entries = new List<KeyValuePair<object[], object[]>>();
+                var scalers = new Dictionary<string, ScalerMetadata>();
 
                 foreach (var it in session.ReadObjects)
                 {
@@ -205,13 +200,13 @@ namespace DLMS_COMMUNICATION.Reader
 
                     var captureObjects = profile.GetCaptureObject();
 
-                    // Lecture lignes par date
+                    // Lire les scalers EXPLICITEMENT par capture object,
+                    // puis reset Scaler=1 pour empêcher Gurux d'auto-appliquer
+                    ReadAndResetScalersForCaptureObjects(session, captureObjects, scalers);
+
+                    // Lecture lignes par date — valeurs GARANTIES brutes (Scaler=1 sur tous les objets)
                     object[] rows = session.Reader
                             .ReadRowsByRange(profile, datestart2, dateend2);
-
-                    // Pas de conversion scaler ici — les valeurs brutes du buffer sont
-                    // retournées telles quelles. La conversion est gérée côté front-end
-                    // car le facteur varie selon le modèle de compteur.
 
                     // Colonnes
                     object[] cols = new object[captureObjects.Length];
@@ -227,7 +222,16 @@ namespace DLMS_COMMUNICATION.Reader
                     entries.Add(new KeyValuePair<object[], object[]>(safeRows, cols));
                 }
 
-                return JsonConvert.SerializeObject(entries, new JsonSerializerSettings
+                // Lire TC/TT
+                var tctt = ReadTcTtValues(session);
+                var envelope = new ProfileDataEnvelope
+                {
+                    Entries = entries,
+                    Scalers = scalers,
+                    TcTtValues = tctt
+                };
+
+                return JsonConvert.SerializeObject(envelope, new JsonSerializerSettings
                 {
                     ReferenceLoopHandling = ReferenceLoopHandling.Ignore
                 });
@@ -274,6 +278,8 @@ namespace DLMS_COMMUNICATION.Reader
                     session.Reader.GetAssociationView(session.OutputFile);
                 }
 
+                var scalers = new Dictionary<string, ScalerMetadata>();
+
                 foreach (KeyValuePair<string, int> it in session.ReadObjects)
                 {
                     var item = session.Client.Objects.FindByLN(ObjectType.ProfileGeneric, it.Key);
@@ -287,7 +293,7 @@ namespace DLMS_COMMUNICATION.Reader
                         {
                             entriesInUse = Convert.ToInt64(session.Reader.Read(item, 7));
                         }
-                        
+
                         long entries = -1;
                         if ((item.GetAccess(8) & AccessMode.Read) != 0)
                         {
@@ -301,28 +307,40 @@ namespace DLMS_COMMUNICATION.Reader
                         {
                             continue;
                         }
-                        
+
                         GXDLMSObject[] cols1 = (item as GXDLMSProfileGeneric).GetCaptureObject();
+
+                        // Lire scalers explicitement puis reset pour empêcher Gurux d'auto-appliquer
+                        ReadAndResetScalersForCaptureObjects(session, cols1, scalers);
 
                         var index = count == 0 ? 1 : entriesInUse - (count - 1);
                         var count2 = count == 0 ? entriesInUse : count;
 
                         object[] rows = session.Reader.ReadRowsByEntry(item as GXDLMSProfileGeneric, Convert.ToUInt32(index), Convert.ToUInt32(count2));
                         object[] cols = new object[cols1.Length];
-                        
+
                         int i = 0;
                         foreach (GXDLMSObject col in cols1)
                         {
                             cols[i++] = col.Name.ToString();
                         }
-                        
+
                         var safeRows = SafeConvertRows(rows);
 
                         session.Entries.Add(new KeyValuePair<object[], object[]>(safeRows, cols));
                     }
                 }
 
-                jsonText = JsonConvert.SerializeObject(session.Entries, new JsonSerializerSettings
+                // Lire TC/TT
+                var tctt = ReadTcTtValues(session);
+                var envelope = new ProfileDataEnvelope
+                {
+                    Entries = session.Entries,
+                    Scalers = scalers,
+                    TcTtValues = tctt
+                };
+
+                jsonText = JsonConvert.SerializeObject(envelope, new JsonSerializerSettings
                 {
                     ReferenceLoopHandling = ReferenceLoopHandling.Ignore
                 });
@@ -336,50 +354,180 @@ namespace DLMS_COMMUNICATION.Reader
             }
         }
 
-        /// <summary>
-        /// Divise les valeurs du buffer profil par le scaler Gurux pour obtenir
-        /// les valeurs conformes aux exports constructeur.
-        /// Le buffer DLMS stocke: raw × scaler. On veut: raw (= buffer ÷ scaler).
-        /// Scaler Gurux = 10^exposant (ex: 1000 pour kWh→Wh, 10 pour A×10, 100 pour V×100)
-        /// </summary>
-        private void ApplyInverseScalers(object[] rows, double[] scalers)
+        private static readonly string[] TcTtObis = new[]
         {
-            foreach (var row in rows)
-            {
-                if (row is object[] rowArray)
-                {
-                    for (int i = 0; i < rowArray.Length && i < scalers.Length; i++)
-                    {
-                        var scaler = scalers[i];
-                        // Skip: non initialisé (0), pas de scaling (1), ou invalide
-                        if (scaler == 0 || scaler == 1 || double.IsNaN(scaler) || double.IsInfinity(scaler))
-                            continue;
-                        if (rowArray[i] == null) continue;
+            "1.0.0.4.2.255",  // CT numerator
+            "1.0.0.4.3.255",  // CT denominator
+            "1.0.0.4.5.255",  // VT numerator
+            "1.0.0.4.6.255",  // VT denominator
+        };
 
-                        try
+        /// <summary>
+        /// Lit l'attribut 3 (scaler+unit) de chaque capture object Register/ExtendedRegister/DemandRegister,
+        /// stocke le résultat dans le dictionnaire scalers, puis RESET le Scaler à 1 sur l'objet Gurux
+        /// pour empêcher UpdateValue() d'auto-appliquer le scaler lors du parsing du buffer.
+        /// Résultat : les valeurs du buffer seront TOUJOURS brutes.
+        /// </summary>
+        private void ReadAndResetScalersForCaptureObjects(
+            IDLMSCommunicationSession session,
+            GXDLMSObject[] captureObjects,
+            Dictionary<string, ScalerMetadata> scalers)
+        {
+            foreach (var obj in captureObjects)
+            {
+                if (scalers.ContainsKey(obj.LogicalName))
+                    continue; // Déjà lu pour un profil précédent dans la même session
+
+                if (obj is GXDLMSRegister || obj is GXDLMSExtendedRegister || obj is GXDLMSDemandRegister)
+                {
+                    try
+                    {
+                        // Lire attribut 3 (scaler+unit) individuellement
+                        int attrIndex = obj is GXDLMSDemandRegister ? 4 : 3;
+                        session.Reader.Read(obj, attrIndex);
+
+                        double scaler = 1;
+                        int unitCode = 0;
+
+                        if (obj is GXDLMSExtendedRegister ext)
                         {
-                            if (rowArray[i] is long l)
-                                rowArray[i] = (double)l / scaler;
-                            else if (rowArray[i] is int n)
-                                rowArray[i] = (double)n / scaler;
-                            else if (rowArray[i] is uint u)
-                                rowArray[i] = (double)u / scaler;
-                            else if (rowArray[i] is ulong ul)
-                                rowArray[i] = (double)ul / scaler;
-                            else if (rowArray[i] is double d)
-                                rowArray[i] = d / scaler;
-                            else if (rowArray[i] is float f)
-                                rowArray[i] = (double)f / scaler;
-                            else if (rowArray[i] is decimal dec)
-                                rowArray[i] = (double)dec / scaler;
+                            scaler = ext.Scaler;
+                            unitCode = (int)ext.Unit;
+                            // RESET pour empêcher Gurux d'auto-appliquer
+                            ext.Scaler = 1;
+                            ext.Unit = GuruxUnit.None;
                         }
-                        catch
+                        else if (obj is GXDLMSRegister reg)
                         {
-                            // Valeur non convertible, garder telle quelle
+                            scaler = reg.Scaler;
+                            unitCode = (int)reg.Unit;
+                            reg.Scaler = 1;
+                            reg.Unit = GuruxUnit.None;
                         }
+                        else if (obj is GXDLMSDemandRegister dem)
+                        {
+                            scaler = dem.Scaler;
+                            unitCode = (int)dem.Unit;
+                            dem.Scaler = 1;
+                            dem.Unit = GuruxUnit.None;
+                        }
+
+                        int exponent = (scaler > 0 && scaler != 1)
+                            ? (int)Math.Round(Math.Log10(scaler))
+                            : 0;
+
+                        scalers[obj.LogicalName] = new ScalerMetadata
+                        {
+                            Scaler = scaler,
+                            Exponent = exponent,
+                            Unit = ((GuruxUnit)unitCode).ToString(),
+                            UnitCode = unitCode
+                        };
+
+                        _logger?.LogDebug("Scaler lu pour {Obis}: scaler={Scaler}, unit={Unit}",
+                            obj.LogicalName, scaler, ((GuruxUnit)unitCode).ToString());
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogWarning("Échec lecture scaler pour {Obis}: {Error}",
+                            obj.LogicalName, ex.Message);
+
+                        // Scaler inconnu — stocker 1 par défaut mais loguer l'échec
+                        scalers[obj.LogicalName] = new ScalerMetadata
+                        {
+                            Scaler = 1,
+                            Exponent = 0,
+                            Unit = "None",
+                            UnitCode = 0
+                        };
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Lit l'horloge du compteur (OBIS 0.0.1.0.0.255, attribut 2).
+        /// Retourne un JSON avec la date/heure du compteur.
+        /// </summary>
+        public async Task<string> ReadClockAsync(IDLMSCommunicationSession session)
+        {
+            try
+            {
+                if (!session.AssociationLoaded)
+                {
+                    bool loadedFromFile = false;
+                    if (!string.IsNullOrEmpty(session.OutputFile))
+                    {
+                        try
+                        {
+                            session.Client.Objects.Clear();
+                            session.Client.Objects.AddRange(GXDLMSObjectCollection.Load(session.OutputFile));
+                            loadedFromFile = true;
+                        }
+                        catch { }
+                    }
+                    if (!loadedFromFile)
+                    {
+                        session.Reader.GetAssociationView(session.OutputFile);
+                    }
+                    session.AssociationLoaded = true;
+                }
+
+                var clockObj = session.Client.Objects.FindByLN(ObjectType.Clock, "0.0.1.0.0.255");
+                if (clockObj == null)
+                {
+                    return JsonConvert.SerializeObject(new { error = "Objet Clock non trouvé sur ce compteur" });
+                }
+
+                // Lire attribut 2 (time)
+                var clockValue = session.Reader.Read(clockObj, 2);
+                var clock = clockObj as GXDLMSClock;
+
+                var result = new
+                {
+                    clock = clock?.Time?.ToFormatString() ?? clockValue?.ToString(),
+                    deviation = clock?.Deviation,
+                    status = clock?.Status.ToString(),
+                    timeZone = clock?.TimeZone
+                };
+
+                return JsonConvert.SerializeObject(result);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "ReadClockAsync echec: {Message}", ex.Message);
+                return JsonConvert.SerializeObject(new { error = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Lit les 4 OBIS codes TC/TT depuis le compteur.
+        /// Retourne null pour les OBIS non supportés.
+        /// </summary>
+        private Dictionary<string, double?> ReadTcTtValues(IDLMSCommunicationSession session)
+        {
+            var result = new Dictionary<string, double?>();
+            foreach (var obis in TcTtObis)
+            {
+                try
+                {
+                    var obj = session.Client.Objects.FindByLN(ObjectType.None, obis);
+                    if (obj != null)
+                    {
+                        var val = session.Reader.Read(obj, 2);
+                        result[obis] = val != null && double.TryParse(val.ToString(), out var d) ? d : null;
+                    }
+                    else
+                    {
+                        result[obis] = null;
+                    }
+                }
+                catch
+                {
+                    result[obis] = null;
+                }
+            }
+            return result;
         }
 
         private object[] SafeConvertRows(object[] originalRows)

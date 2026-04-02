@@ -29,10 +29,10 @@ public class ProfileReadingConfig : IProfileReadingConfig
 
     private static readonly List<ProfileReadingEntry> Defaults = new()
     {
-        new() { Priority = 1, ProfileObis = "1.0.99.3.0.255", TimeoutSeconds = 90, FallbackMaxHours = 24 },
-        new() { Priority = 2, ProfileObis = "1.0.99.1.0.255", TimeoutSeconds = 60, FallbackMaxHours = 24 },
-        new() { Priority = 3, ProfileObis = "1.0.99.2.0.255", TimeoutSeconds = 120, FallbackMaxHours = 12 },
-        new() { Priority = 4, ProfileObis = "0.0.98.1.0.255", TimeoutSeconds = 20, FallbackMaxHours = 24 },
+        new() { Priority = 1, ProfileObis = "0.0.98.1.0.255", TimeoutSeconds = 90, FallbackMaxHours = 720 },
+        new() { Priority = 2, ProfileObis = "1.0.99.3.0.255", TimeoutSeconds = 90, FallbackMaxHours = 24 },
+        new() { Priority = 3, ProfileObis = "1.0.99.1.0.255", TimeoutSeconds = 60, FallbackMaxHours = 24 },
+        new() { Priority = 4, ProfileObis = "1.0.99.2.0.255", TimeoutSeconds = 120, FallbackMaxHours = 12 },
         new() { Priority = 5, ProfileObis = "0.0.99.98.0.255", TimeoutSeconds = 20, FallbackMaxHours = 24 },
         new() { Priority = 6, ProfileObis = "0.0.99.98.1.255", TimeoutSeconds = 20, FallbackMaxHours = 24 },
         new() { Priority = 7, ProfileObis = "0.0.99.98.2.255", TimeoutSeconds = 20, FallbackMaxHours = 24 },
